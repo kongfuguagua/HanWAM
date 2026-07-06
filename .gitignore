@@ -1,0 +1,53 @@
+# Build
+build/
+*.pyc
+*.pyd
+*.obj
+*.lib
+*.exp
+*.log
+
+# Runtime outputs
+logs/
+.pytest_cache/
+solver_test_output.txt
+*.pyc
+control/pidfix/results/
+roomtest/output/
+
+# Cython build artifacts
+scripts/build/
+
+# IDE
+.vscode/
+
+# Local virtual environments
+.venv/
+
+# Sensitive config — MUST exclude (security reviewer flagged)
+app/config/config.yaml
+app/config/*.yaml
+
+# Environment files — local secrets
+.env
+.env.*
+!.env.example
+
+# OMC internal state
+.omc/
+
+# OS
+.DS_Store
+Thumbs.db
+
+data/*
+!data/dataset/
+!data/dataset/**
+*.csv
+*/outputs/*
+
+AGENTS.md
+*.pt
+*.pth
+*.pkl
+*.joblib

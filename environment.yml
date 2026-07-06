@@ -1,0 +1,28 @@
+name: haier-jk
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - scikit-learn
+  - scipy
+  - libstdcxx-ng
+  - joblib
+  - matplotlib
+  - openpyxl
+  - tqdm
+  - pyyaml
+  - ipykernel
+  - pip:
+      - --index-url https://download.pytorch.org/whl/cu128
+      - --extra-index-url https://pypi.org/simple
+      - torch
+      - torchvision
+      - torchaudio
+      - einops
+      - tensorboard
+      - rich
+      - hydra-core
+      - swanlab

@@ -17,6 +17,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actual-on-threshold-hz", type=float, default=1.0)
     parser.add_argument("--short-cycle-seconds", type=float, default=180.0)
     parser.add_argument("--high-fan-threshold", type=float, default=500.0)
+    parser.add_argument("--comfort-band-c", type=float, default=0.5)
+    parser.add_argument("--high-freq-threshold-hz", type=float, default=60.0)
+    parser.add_argument("--lookahead-seconds", type=float, default=600.0)
     parser.add_argument("--checkpoint", type=Path, default=None, help="Optional HanWAM checkpoint for action z-score diagnostics")
     parser.add_argument("--ood-z-threshold", type=float, default=2.0)
     parser.add_argument("--extreme-z-threshold", type=float, default=3.0)
@@ -148,6 +151,82 @@ def analyze_off_cooling(
     return pd.DataFrame(rows)
 
 
+def _target_temperature(frame: pd.DataFrame) -> np.ndarray:
+    for col in ("target_T_in", "T_set"):
+        if col in frame:
+            return frame[col].to_numpy(dtype=float)
+    return np.full(len(frame), np.nan, dtype=float)
+
+
+def analyze_oscillation(
+    controller_log: pd.DataFrame,
+    *,
+    on_threshold_hz: float = 15.0,
+    actual_on_threshold_hz: float = 1.0,
+    short_cycle_seconds: float = 180.0,
+    comfort_band_c: float = 0.5,
+    high_freq_threshold_hz: float = 60.0,
+    lookahead_seconds: float = 600.0,
+) -> pd.DataFrame:
+    rows = []
+    for run, frame in controller_log.sort_values(["run", "elapsed_seconds"]).groupby("run", sort=False):
+        elapsed = frame["elapsed_seconds"].to_numpy(dtype=float)
+        if len(elapsed) == 0:
+            continue
+        step_seconds = float(np.median(np.diff(elapsed))) if len(elapsed) > 1 else 5.0
+        hours = max(float(elapsed[-1] - elapsed[0] + step_seconds) / 3600.0, 1e-9)
+        freq_target = frame["freq_target"].to_numpy(dtype=float)
+        actual_freq = frame["freq"].to_numpy(dtype=float) if "freq" in frame else np.full(len(frame), np.nan)
+        temp = frame["T_in"].to_numpy(dtype=float)
+        target = _target_temperature(frame)
+
+        target_on = freq_target >= float(on_threshold_hz)
+        actual_on = actual_freq > float(actual_on_threshold_hz)
+        high_target = freq_target >= float(high_freq_threshold_hz)
+        near_target = np.isfinite(target) & (np.abs(temp - target) <= float(comfort_band_c))
+        near_target_off = near_target & ~target_on
+        high_start_count = int(np.logical_and(high_target[1:], ~high_target[:-1]).sum()) if len(high_target) > 1 else 0
+
+        lookahead_count = max(1, int(np.ceil(float(lookahead_seconds) / max(step_seconds, 1e-9))))
+        off_to_high_count = 0
+        off_to_high_event_count = 0
+        was_near_off = False
+        for idx, is_near_off in enumerate(near_target_off):
+            if not bool(is_near_off):
+                was_near_off = False
+                continue
+            future_high = high_target[idx + 1 : min(len(high_target), idx + 1 + lookahead_count)]
+            has_future_high = bool(future_high.any())
+            if has_future_high:
+                off_to_high_count += 1
+                if not was_near_off:
+                    off_to_high_event_count += 1
+            was_near_off = True
+
+        on_durations, off_durations = _cycle_durations(elapsed, actual_on)
+        short_on = [duration for duration in on_durations if duration < float(short_cycle_seconds)]
+        rows.append(
+            {
+                "run": run,
+                "steps": int(len(frame)),
+                "duration_h": float(hours),
+                "near_target_steps": int(near_target.sum()),
+                "near_target_off_steps": int(near_target_off.sum()),
+                "near_target_off_ratio": float(near_target_off.sum() / max(int(near_target.sum()), 1)),
+                "near_target_off_to_high_within_10min_count": int(off_to_high_count),
+                "near_target_off_to_high_within_10min_event_count": int(off_to_high_event_count),
+                "near_target_off_to_high_within_10min_ratio": float(off_to_high_count / max(int(near_target_off.sum()), 1)),
+                "high_start_count": int(high_start_count),
+                "high_starts_per_hour": float(high_start_count / hours),
+                "short_on_cycle_count": int(len(short_on)),
+                "short_on_cycle_ratio": float(len(short_on) / max(len(on_durations), 1)),
+                **_duration_stats("on", on_durations),
+                **_duration_stats("off", off_durations),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def analyze_action_ood(
     controller_log: pd.DataFrame,
     checkpoint_path: Path,
@@ -210,6 +289,17 @@ def main() -> None:
     )
     action_stats.to_csv(output_dir / "action_cycle_statistics.csv", index=False, encoding="utf-8-sig")
     aggregate_action_stats(action_stats).to_csv(output_dir / "action_cycle_aggregate.csv", index=False, encoding="utf-8-sig")
+    oscillation_stats = analyze_oscillation(
+        controller_log,
+        on_threshold_hz=args.on_threshold_hz,
+        actual_on_threshold_hz=args.actual_on_threshold_hz,
+        short_cycle_seconds=args.short_cycle_seconds,
+        comfort_band_c=args.comfort_band_c,
+        high_freq_threshold_hz=args.high_freq_threshold_hz,
+        lookahead_seconds=args.lookahead_seconds,
+    )
+    oscillation_stats.to_csv(output_dir / "oscillation_statistics.csv", index=False, encoding="utf-8-sig")
+    aggregate_action_stats(oscillation_stats).to_csv(output_dir / "oscillation_aggregate.csv", index=False, encoding="utf-8-sig")
 
     trajectory_path = args.rollout_dir / "trajectories.csv"
     if trajectory_path.exists():

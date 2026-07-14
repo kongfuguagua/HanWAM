@@ -13,8 +13,13 @@ try:
 except Exception:  # pragma: no cover - V3 model artifact may be absent in minimal installs.
     ContinuousEnthalpyRoomEnv = None
 
+try:
+    from simu.room_hybrid import HybridRoomEnv
+except Exception:  # pragma: no cover - hybrid artifacts may be absent in minimal installs.
+    HybridRoomEnv = None
 
-ENV_OBS_COLS = ["T_out", "T_out_coil", "T_in", "T_in_coil", "RH_in", "fan_in"]
+
+ENV_OBS_COLS = ["T_out", "T_out_coil", "T_out_discharge", "T_in", "T_in_coil", "RH_in", "fan_in"]
 
 
 @dataclass
@@ -22,6 +27,7 @@ class EnvironmentState:
     elapsed_seconds: float
     T_out: float
     T_out_coil: float
+    T_out_discharge: float
     T_in: float
     T_in_coil: float
     RH_in: float
@@ -35,6 +41,7 @@ class EnvironmentState:
             "elapsed_seconds": self.elapsed_seconds,
             "T_out": self.T_out,
             "T_out_coil": self.T_out_coil,
+            "T_out_discharge": self.T_out_discharge,
             "T_in": self.T_in,
             "T_in_coil": self.T_in_coil,
             "RH_in": self.RH_in,
@@ -83,6 +90,8 @@ class EnvironmentSimulator:
         air_density_kg_m3: float = 1.2,
         room_heat_capacity_kj_per_c: float = 90.0,
         passive_heat_tau_seconds: float = 14_400.0,
+        temperature_model: str | None = None,
+        room_hybrid_kwargs: dict | None = None,
         temperature_env: object | None = None,
     ):
         self.mode = mode
@@ -92,9 +101,15 @@ class EnvironmentSimulator:
         self.air_density_kg_m3 = float(air_density_kg_m3)
         self.room_heat_capacity_kj_per_c = float(room_heat_capacity_kj_per_c)
         self.passive_heat_tau_seconds = float(passive_heat_tau_seconds)
+        requested_temperature_model = str(temperature_model or "auto")
         if temperature_env is not None:
             self.temperature_env = temperature_env
             self.temperature_model = "custom"
+        elif requested_temperature_model == "room_hybrid":
+            if HybridRoomEnv is None:
+                raise RuntimeError("simulator.environment.temperature_model=room_hybrid requires simu.room_hybrid artifacts")
+            self.temperature_env = HybridRoomEnv(**(room_hybrid_kwargs or {}))
+            self.temperature_model = "room_hybrid"
         elif str(mode) in {"1", "1.0"} and ContinuousEnthalpyRoomEnv is not None:
             self.temperature_env = ContinuousEnthalpyRoomEnv(
                 passive_heat_tau_seconds=self.passive_heat_tau_seconds
@@ -110,6 +125,7 @@ class EnvironmentSimulator:
             self.T_out = float(initial_state["T_out"])
             self.T_in = float(initial_state["T_in"])
             self.T_out_coil = float(initial_state["T_out_coil"])
+            self.T_out_discharge = float(initial_state.get("T_out_discharge", self.T_out))
             self.T_in_coil = float(initial_state["T_in_coil"])
             self.RH_in = float(initial_state.get("RH_in", 0.6))
             self.fan_in = float(initial_state.get("fan_in", self.rated_fan_rpm))
@@ -118,6 +134,7 @@ class EnvironmentSimulator:
             if raw.shape[0] < 4:
                 raise ValueError("initial_state must contain at least T_out, T_in, T_out_coil, T_in_coil")
             self.T_out, self.T_in, self.T_out_coil, self.T_in_coil = raw[:4].tolist()
+            self.T_out_discharge = self.T_out
             self.RH_in = float(raw[4]) if raw.shape[0] > 4 else 0.6
             self.fan_in = float(raw[5]) if raw.shape[0] > 5 else self.rated_fan_rpm
 
@@ -125,7 +142,28 @@ class EnvironmentSimulator:
             self.fan_in = self.rated_fan_rpm
 
         self.elapsed_seconds = 0.0
-        if self.temperature_model == "room_v3":
+        if self.temperature_model == "room_hybrid":
+            if isinstance(initial_state, dict):
+                temp = self.temperature_env.reset(initial_observation=initial_state)
+            else:
+                temp = self.temperature_env.reset(
+                    initial_observation={
+                        "T_out": self.T_out,
+                        "T_in": self.T_in,
+                        "T_out_coil": self.T_out_coil,
+                        "T_out_discharge": self.T_out_discharge,
+                        "T_in_coil": self.T_in_coil,
+                        "RH_in": self.RH_in,
+                        "fan_in": self.fan_in,
+                        "mode": float(self.mode),
+                    }
+                )
+            self.T_in = float(temp.get("T_in", self.T_in))
+            self.T_out = float(temp.get("T_out", self.T_out))
+            self.T_out_coil = float(temp.get("T_out_coil", self.T_out_coil))
+            self.T_out_discharge = float(temp.get("T_out_discharge", self.T_out_discharge))
+            self.T_in_coil = float(temp.get("T_in_coil", self.T_in_coil))
+        elif self.temperature_model == "room_v3":
             if isinstance(initial_state, dict):
                 self.temperature_env.reset(initial_observation=initial_state)
             else:
@@ -137,6 +175,7 @@ class EnvironmentSimulator:
             elapsed_seconds=0.0,
             T_out=self.T_out,
             T_out_coil=self.T_out_coil,
+            T_out_discharge=self.T_out_discharge,
             T_in=self.T_in,
             T_in_coil=self.T_in_coil,
             RH_in=self.RH_in,
@@ -178,13 +217,30 @@ class EnvironmentSimulator:
         if not self._ready:
             raise RuntimeError("Call reset() before step().")
         previous_T_in = self.T_in
-        temp = self.temperature_env.step(
-            freq=float(ac_output["freq"]),
-            eev=float(ac_output["eev"]),
-            fan_out=float(ac_output["fan_out"]),
-        )
+        if self.temperature_model == "room_hybrid":
+            temp = self.temperature_env.step(
+                float(ac_output["freq"]),
+                float(ac_output["eev"]),
+                float(ac_output["fan_out"]),
+            )
+        else:
+            temp = self.temperature_env.step(
+                freq=float(ac_output["freq"]),
+                eev=float(ac_output["eev"]),
+                fan_out=float(ac_output["fan_out"]),
+            )
         self.elapsed_seconds = float(temp["elapsed_seconds"])
         self.T_in = float(temp["T_in"])
+        self.T_out = float(temp.get("T_out", self.T_out))
+        self.T_out_coil = float(temp.get("T_out_coil", self.T_out_coil))
+        self.T_in_coil = float(temp.get("T_in_coil", self.T_in_coil))
+        freq = max(float(ac_output.get("freq", 0.0)), 0.0)
+        if "T_out_discharge" in temp:
+            self.T_out_discharge = float(temp["T_out_discharge"])
+        else:
+            target_discharge = self.T_out + 0.45 * freq
+            alpha = np.clip(self.step_seconds / 120.0, 0.0, 1.0)
+            self.T_out_discharge = float(self.T_out_discharge + alpha * (target_discharge - self.T_out_discharge))
         thermal_power_w = self._thermal_power(
             self.T_in,
             previous_T_in=previous_T_in,
@@ -196,13 +252,14 @@ class EnvironmentSimulator:
             elapsed_seconds=self.elapsed_seconds,
             T_out=self.T_out,
             T_out_coil=self.T_out_coil,
+            T_out_discharge=self.T_out_discharge,
             T_in=self.T_in,
             T_in_coil=self.T_in_coil,
             RH_in=self.RH_in,
             fan_in=self.fan_in,
             thermal_power_w=thermal_power_w,
             thermal_kwh=thermal_kwh,
-            model_spread=float(temp["model_spread"]),
+            model_spread=float(temp.get("model_spread", 0.0)),
         )
         return state.as_dict()
 

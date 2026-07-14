@@ -1,53 +1,71 @@
-# Build
+# Build and interpreter cache
 build/
-*.pyc
+dist/
+__pycache__/
+*.py[cod]
 *.pyd
 *.obj
 *.lib
 *.exp
-*.log
+
+# Test and local tooling cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+solver_test_output.txt
 
 # Runtime outputs
 logs/
-.pytest_cache/
-solver_test_output.txt
-*.pyc
-control/pidfix/results/
+outputs/
+control/outputs/
 roomtest/output/
+simu/*/output/
+simu/*/outputs/
+*.log
 
-# Cython build artifacts
-scripts/build/
-
-# IDE
-.vscode/
-
-# Local virtual environments
+# Local environments and editor state
 .venv/
-
-# Sensitive config — MUST exclude (security reviewer flagged)
-app/config/config.yaml
-app/config/*.yaml
-
-# Environment files — local secrets
 .env
 .env.*
 !.env.example
-
-# OMC internal state
+.vscode/
+.idea/
 .omc/
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
-data/*
-!data/dataset/
-!data/dataset/**
+# Real datasets and generated data artifacts are intentionally external.
 *.csv
-*/outputs/*
+*.xlsx
+*.xls
+*.parquet
+*.npy
+*.npz
+data/raw/
+data/dataset/
+data/dataset_*/
+data/**/skipped_files.csv
+data/**/status_data_*.csv
 
-AGENTS.md
+# Model checkpoints and binary model artifacts are intentionally external.
 *.pt
 *.pth
+*.ckpt
 *.pkl
 *.joblib
+*.onnx
+control/HanWAM/checkpoints/*
+!control/HanWAM/checkpoints/README.md
+
+# Generated media and large reference artifacts
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Local-only agent notes
+AGENTS.md

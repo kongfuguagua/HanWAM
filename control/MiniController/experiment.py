@@ -22,6 +22,102 @@ from .tracking import SwanLabTracker
 from .visualization import plot_run_debug, plot_summary
 
 
+def _saturation_vapor_pressure_kpa(temp_c: float) -> float:
+    temp = float(temp_c)
+    return float(0.61094 * np.exp((17.625 * temp) / (temp + 243.04)))
+
+
+def relative_humidity_from_wet_bulb(
+    dry_bulb_c: float,
+    wet_bulb_c: float,
+    pressure_kpa: float = 101.325,
+) -> float:
+    """Approximate RH from dry/wet bulb temperatures using a ventilated psychrometer equation."""
+    dry = float(dry_bulb_c)
+    wet = min(float(wet_bulb_c), dry)
+    gamma = 0.00066 * (1.0 + 0.00115 * wet) * float(pressure_kpa)
+    vapor_pressure = _saturation_vapor_pressure_kpa(wet) - gamma * (dry - wet)
+    rh = vapor_pressure / max(_saturation_vapor_pressure_kpa(dry), 1e-9)
+    return float(np.clip(rh, 0.01, 1.0))
+
+
+def _condition_value(condition: dict, *names: str, default: float | None = None) -> float:
+    for name in names:
+        if name in condition and condition[name] is not None:
+            return float(condition[name])
+    if default is None:
+        raise KeyError(f"Missing condition field; expected one of {names}")
+    return float(default)
+
+
+def standard_condition_frame(
+    condition: dict,
+    *,
+    mode: int,
+    horizon_seconds: int,
+    step_seconds: int,
+    name: str,
+) -> pd.DataFrame:
+    indoor_dry = _condition_value(
+        condition,
+        "indoor_initial_dry_bulb_c",
+        "indoor_initial_dry_c",
+        "initial_T_in_c",
+    )
+    indoor_wet = _condition_value(
+        condition,
+        "indoor_initial_wet_bulb_c",
+        "indoor_initial_wet_c",
+        "initial_T_in_wet_bulb_c",
+    )
+    target_dry = _condition_value(
+        condition,
+        "indoor_target_dry_bulb_c",
+        "indoor_target_dry_c",
+        "target_T_in_c",
+    )
+    outdoor_dry = _condition_value(
+        condition,
+        "outdoor_dry_bulb_c",
+        "outdoor_dry_c",
+        "T_out_c",
+    )
+    outdoor_wet = _condition_value(
+        condition,
+        "outdoor_wet_bulb_c",
+        "outdoor_wet_c",
+        "T_out_wet_bulb_c",
+    )
+    rh_in = float(condition.get("RH_in", relative_humidity_from_wet_bulb(indoor_dry, indoor_wet)))
+    outdoor_rh = float(condition.get("RH_out", relative_humidity_from_wet_bulb(outdoor_dry, outdoor_wet)))
+    steps = int(horizon_seconds // step_seconds) + 1
+    elapsed = np.arange(steps, dtype=float) * float(step_seconds)
+    timestamp = pd.Timestamp("2026-07-06 00:00:00") + pd.to_timedelta(elapsed, unit="s")
+    payload = {
+        "ts": timestamp,
+        "I_comp": np.zeros(steps, dtype=float),
+        "RH_in": np.full(steps, rh_in, dtype=float),
+        "RH_out": np.full(steps, outdoor_rh, dtype=float),
+        "T_in": np.full(steps, indoor_dry, dtype=float),
+        "T_in_coil": np.full(steps, float(condition.get("T_in_coil", indoor_dry)), dtype=float),
+        "T_out": np.full(steps, outdoor_dry, dtype=float),
+        "T_out_coil": np.full(steps, float(condition.get("T_out_coil", outdoor_dry)), dtype=float),
+        "T_out_discharge": np.full(steps, float(condition.get("T_out_discharge", outdoor_dry)), dtype=float),
+        "T_set": np.full(steps, target_dry, dtype=float),
+        "eev": np.full(steps, float(condition.get("eev", 0.0)), dtype=float),
+        "energy_cum": np.zeros(steps, dtype=float),
+        "fan_in": np.full(steps, float(condition.get("fan_in", 900.0)), dtype=float),
+        "fan_out": np.full(steps, float(condition.get("fan_out", 0.0)), dtype=float),
+        "freq": np.full(steps, float(condition.get("freq", 0.0)), dtype=float),
+        "freq_in_tgt": np.full(steps, float(condition.get("freq_target", 0.0)), dtype=float),
+        "freq_target": np.full(steps, float(condition.get("freq_target", 0.0)), dtype=float),
+        "mode": np.full(steps, float(mode), dtype=float),
+        "elapsed_seconds": elapsed,
+        "condition": np.full(steps, str(condition.get("name", name)), dtype=object),
+    }
+    return pd.DataFrame(payload)
+
+
 def observation_from_state(
     env_state: dict,
     ac_state: dict,
@@ -32,6 +128,7 @@ def observation_from_state(
     return {
         "T_out": env_state["T_out"],
         "T_out_coil": env_state["T_out_coil"],
+        "T_out_discharge": env_state.get("T_out_discharge", env_state["T_out"]),
         "T_in": env_state["T_in"],
         "T_in_coil": env_state["T_in_coil"],
         "freq_target": ac_state["freq_target"],
@@ -64,6 +161,7 @@ def initial_environment_state(frame: pd.DataFrame) -> dict:
         "T_out": float(row["T_out"]),
         "T_in": float(row["T_in"]),
         "T_out_coil": float(row["T_out_coil"]),
+        "T_out_discharge": float(row.get("T_out_discharge", row["T_out"])),
         "T_in_coil": float(row["T_in_coil"]),
         "RH_in": float(row.get("RH_in", 0.6)),
         "fan_in": float(row.get("fan_in", 900.0)),
@@ -80,6 +178,7 @@ def run_closed_loop(
     horizon_seconds: int,
     step_seconds: int = 5,
     simulator_config: dict | None = None,
+    control_deadline_seconds: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     simulator_config = simulator_config or {}
     ac_cfg = simulator_config.get("air_conditioner") or {}
@@ -101,6 +200,8 @@ def run_closed_loop(
         air_density_kg_m3=float(env_cfg.get("air_density_kg_m3", 1.2)),
         room_heat_capacity_kj_per_c=float(env_cfg.get("room_heat_capacity_kj_per_c", 90.0)),
         passive_heat_tau_seconds=float(env_cfg.get("passive_heat_tau_seconds", 14_400.0)),
+        temperature_model=env_cfg.get("temperature_model"),
+        room_hybrid_kwargs=env_cfg.get("room_hybrid") or {},
     )
     ac_state = ac.reset(freq0=float(frame["freq"].iloc[0]), target0=float(frame["freq_target"].iloc[0]))
     env_state = env.reset(initial_environment_state(frame))
@@ -143,7 +244,7 @@ def run_closed_loop(
                 horizon_seconds=step_seconds,
                 elapsed_seconds=float(env_state["elapsed_seconds"]),
                 metadata={
-                    "ddl_seconds": float(horizon_seconds),
+                    "ddl_seconds": float(control_deadline_seconds if control_deadline_seconds is not None else horizon_seconds),
                     "experiment_horizon_seconds": float(horizon_seconds),
                 },
             )
@@ -276,8 +377,31 @@ def run_eval_from_config(config: dict) -> dict:
                 split = scenario.get("split", eval_cfg["split"])
                 horizon_seconds = int(scenario.get("horizon_seconds", eval_cfg["horizon_seconds"]))
                 ddl_seconds = float(scenario.get("ddl_seconds", eval_cfg.get("ddl_seconds", horizon_seconds)))
+                control_deadline_seconds = scenario.get(
+                    "control_deadline_seconds",
+                    scenario.get("reach_deadline_seconds", eval_cfg.get("control_deadline_seconds")),
+                )
+                control_deadline_seconds = None if control_deadline_seconds is None else float(control_deadline_seconds)
                 max_runs = int(scenario.get("max_runs", eval_cfg["max_runs"]))
-                selected = start_windows(runs, split, horizon_steps=horizon_seconds // step_seconds)[:max_runs]
+                condition = scenario.get("condition")
+                if condition:
+                    frame = standard_condition_frame(
+                        condition,
+                        mode=mode,
+                        horizon_seconds=horizon_seconds,
+                        step_seconds=step_seconds,
+                        name=scenario_name,
+                    )
+                    selected = [
+                        SimpleNamespace(
+                            name=str(condition.get("name", scenario_name)),
+                            frame=frame,
+                            split="standard_condition",
+                            path=None,
+                        )
+                    ]
+                else:
+                    selected = start_windows(runs, split, horizon_steps=horizon_seconds // step_seconds)[:max_runs]
                 if not selected:
                     raise ValueError(f"No split={split} mode={mode} runs with requested horizon")
 
@@ -308,12 +432,29 @@ def run_eval_from_config(config: dict) -> dict:
                         horizon_seconds=horizon_seconds,
                         step_seconds=step_seconds,
                         simulator_config=config["simulator"],
+                        control_deadline_seconds=control_deadline_seconds,
                     )
                     summary = summarize_closed_loop(
                         trajectory,
                         target,
                         comfort_band_c=float(eval_cfg["comfort_band_c"]),
                         ddl_seconds=ddl_seconds,
+                        require_final_in_band=bool(
+                            scenario.get(
+                                "success_requires_final_band",
+                                eval_cfg.get("success_requires_final_band", True),
+                            )
+                        ),
+                        reach_deadline_seconds=scenario.get(
+                            "reach_deadline_seconds",
+                            eval_cfg.get("reach_deadline_seconds"),
+                        ),
+                        require_post_reach_band=bool(
+                            scenario.get(
+                                "success_requires_post_reach_band",
+                                eval_cfg.get("success_requires_post_reach_band", False),
+                            )
+                        ),
                     )
                     summary.update({"run": run.name, "policy": method, "mode": mode, "target_T_in": target, "scenario": scenario_name})
                     summaries.append(summary)

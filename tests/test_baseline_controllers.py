@@ -17,11 +17,52 @@ from control.MiniController.config import (
 )
 from control.MiniController.config_schema import expand_modes
 from control.MiniController.tracking import SwanLabTracker
-from control.HanWAM.model import HanWAM
+from control.HanWAM.model import HanWAMControllerModel, HanWAMWorldModel
 from control.HanWAM.controller import HanWAMController
 from control.HanWAM.dataloader import Normalizer
-from control.HanWAM.planner import CEMPlanner
+from control.HanWAM.planner import MPPIPlanner
 from control.HanWAM.type import WAM_ACTION_COLS, WAM_OBS_COLS, WAM_PHYSICAL_COLS
+
+
+def _tiny_hanwam(
+    obs_dim: int = len(WAM_OBS_COLS),
+    action_dim: int = len(WAM_ACTION_COLS),
+    physical_dim: int = len(WAM_PHYSICAL_COLS),
+    latent_dim: int = 8,
+    hidden_dim: int = 16,
+    frames_per_block: int = 2,
+    history_blocks: int = 2,
+    future_blocks: int = 2,
+) -> HanWAMControllerModel:
+    world = HanWAMWorldModel(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
+        action_latent_dim=4,
+        frames_per_block=frames_per_block,
+        history_blocks=history_blocks,
+        future_blocks=future_blocks,
+    )
+    return HanWAMControllerModel(world, physical_dim=physical_dim, hidden_dim=hidden_dim)
+
+
+def _tiny_mppi_planner(config: dict, model: HanWAMControllerModel | None = None) -> MPPIPlanner:
+    model = model or _tiny_hanwam()
+    norm_obs = Normalizer(mean=np.zeros(len(WAM_OBS_COLS), dtype=np.float32), std=np.ones(len(WAM_OBS_COLS), dtype=np.float32))
+    norm_action = Normalizer(mean=np.zeros(len(WAM_ACTION_COLS), dtype=np.float32), std=np.ones(len(WAM_ACTION_COLS), dtype=np.float32))
+    norm_phys = Normalizer(mean=np.zeros(len(WAM_PHYSICAL_COLS), dtype=np.float32), std=np.ones(len(WAM_PHYSICAL_COLS), dtype=np.float32))
+    return MPPIPlanner(
+        model=model,
+        obs_norm=norm_obs,
+        action_norm=norm_action,
+        physical_norm=norm_phys,
+        obs_cols=WAM_OBS_COLS,
+        physical_cols=WAM_PHYSICAL_COLS,
+        action_bounds={"freq_target": (0.0, 80.0), "eev": (69.0, 480.0), "fan_out": (0.0, 900.0)},
+        config=config,
+        device=torch.device("cpu"),
+    )
 
 
 class BaselineControllerTest(unittest.TestCase):
@@ -31,7 +72,7 @@ class BaselineControllerTest(unittest.TestCase):
         self.bounds1 = action_bounds_for_mode(
             self.pid_config,
             1,
-            {"freq_target": (0, 90), "eev": (0, 480), "fan_out": (0, 850)},
+            {"freq_target": (0, 80), "eev": (0, 480), "fan_out": (0, 900)},
         )
         self.bounds3 = action_bounds_for_mode(
             self.pid_config,
@@ -47,7 +88,7 @@ class BaselineControllerTest(unittest.TestCase):
 
     def test_config_uses_method_action_space(self):
         self.assertEqual(expand_modes("all"), [1, 3])
-        self.assertEqual(self.bounds1["freq_target"], (0.0, 90.0))
+        self.assertEqual(self.bounds1["freq_target"], (0.0, 80.0))
         self.assertEqual(self.bounds3["fan_out"], (0.0, 800.0))
 
     def test_pid_cooling_direction(self):
@@ -72,18 +113,26 @@ class BaselineControllerTest(unittest.TestCase):
         np.testing.assert_allclose(payload["action"], [1.0, 2.0, 3.0])
 
     def test_hanwam_rollout_shape(self):
-        model = HanWAM(obs_dim=6, action_dim=3, physical_dim=4, latent_dim=8, hidden_dim=16)
-        latent, physical = model.rollout(torch.zeros(5, 6), torch.zeros(5, 7, 3))
-        self.assertEqual(tuple(latent.shape), (5, 7, 8))
-        self.assertEqual(tuple(physical.shape), (5, 7, 4))
+        model = _tiny_hanwam(obs_dim=6, physical_dim=4, frames_per_block=2, history_blocks=2, future_blocks=3)
+        obs_history = torch.zeros(5, 2, 2, 6)
+        act_history = torch.zeros(5, 2, 2, 3)
+        future_act = torch.zeros(5, 3, 2, 3)
+        latent, physical = model.rollout(obs_history, act_history, future_act)
+        self.assertEqual(tuple(latent.shape), (5, 3, 8))
+        self.assertEqual(tuple(physical.shape), (5, 6, 4))
 
-    def test_hanwam_state_encoder_uses_observation_history(self):
-        model = HanWAM(obs_dim=6, action_dim=3, physical_dim=4, latent_dim=8, hidden_dim=16)
-        obs_a = torch.zeros(5, 4, 6)
+    def test_hanwam_context_encoder_uses_observation_and_action_history(self):
+        world = HanWAMWorldModel(obs_dim=6, action_dim=3, latent_dim=8, hidden_dim=16, action_latent_dim=4, frames_per_block=2, history_blocks=2, future_blocks=2)
+        obs_a = torch.zeros(5, 2, 2, 6)
         obs_b = obs_a.clone()
-        obs_b[:, 1, :] = 1.0
-        delta = (model.encode(obs_a) - model.encode(obs_b)).detach().abs().max()
-        self.assertGreater(float(delta), 0.0)
+        obs_b[:, 1, :, :] = 1.0
+        act_a = torch.zeros(5, 2, 2, 3)
+        act_b = act_a.clone()
+        act_b[:, 1, :, 0] = 1.0
+        obs_delta = (world.encode_context(obs_a, act_a) - world.encode_context(obs_b, act_a)).detach().abs().max()
+        act_delta = (world.encode_context(obs_a, act_a) - world.encode_context(obs_a, act_b)).detach().abs().max()
+        self.assertGreater(float(obs_delta), 0.0)
+        self.assertGreater(float(act_delta), 0.0)
 
     def test_hanwam_controller_uses_runtime_planner_overrides(self):
         model_config = {
@@ -93,8 +142,12 @@ class BaselineControllerTest(unittest.TestCase):
             "physical_dim": len(WAM_PHYSICAL_COLS),
             "latent_dim": 8,
             "hidden_dim": 16,
+            "action_latent_dim": 4,
+            "frames_per_block": 2,
+            "history_blocks": 2,
+            "future_blocks": 1,
         }
-        model = HanWAM(**{key: value for key, value in model_config.items() if key != "class_name"})
+        model = _tiny_hanwam(frames_per_block=2, history_blocks=2, future_blocks=1)
         checkpoint = {
             "obs_cols": WAM_OBS_COLS,
             "target_action_cols": WAM_ACTION_COLS,
@@ -103,13 +156,31 @@ class BaselineControllerTest(unittest.TestCase):
             "target_action_norm": {"mean": [0.0] * len(WAM_ACTION_COLS), "std": [1.0] * len(WAM_ACTION_COLS)},
             "physical_norm": {"mean": [0.0] * len(WAM_PHYSICAL_COLS), "std": [1.0] * len(WAM_PHYSICAL_COLS)},
             "target_action_bounds": {
-                "freq_target": [0.0, 90.0],
+                "freq_target": [0.0, 80.0],
                 "eev": [69.0, 480.0],
-                "fan_out": [0.0, 850.0],
+                "fan_out": [0.0, 900.0],
             },
-            "model_config": model_config,
+            "model_config": {
+                "class_name": "HanWAMControllerModel",
+                "physical_dim": len(WAM_PHYSICAL_COLS),
+                "prober_hidden_dim": 16,
+                "world_model_config": {
+                    "class_name": "HanWAMWorldModel",
+                    "obs_dim": len(WAM_OBS_COLS),
+                    "action_dim": len(WAM_ACTION_COLS),
+                    "latent_dim": 8,
+                    "hidden_dim": 16,
+                    "action_latent_dim": 4,
+                    "frames_per_block": 2,
+                    "history_blocks": 2,
+                    "future_blocks": 1,
+                },
+            },
             "model": model.state_dict(),
-            "planner_config": {"horizon_steps": 24, "cost_weights": {"energy": 2.0}},
+            "planner_config": {"algorithm": "mppi", "horizon_steps": 2, "frames_per_block": 2, "future_blocks": 1, "cost_weights": {"energy": 2.0}},
+            "frames_per_block": 2,
+            "history_blocks": 2,
+            "future_blocks": 1,
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = f"{tmp}/hanwam.pt"
@@ -118,88 +189,740 @@ class BaselineControllerTest(unittest.TestCase):
                 path,
                 mode=1,
                 device="cpu",
-                planner_config={"horizon_steps": 12, "cost_weights": {"action_smooth": 0.05}},
+                planner_config={"horizon_steps": 2, "cost_weights": {"action_smooth": 0.05}},
             )
-        self.assertEqual(controller.planner.horizon_steps, 12)
+        self.assertEqual(controller.planner.horizon_steps, 2)
         self.assertEqual(controller.planner.cost_weights["energy"], 2.0)
         self.assertEqual(controller.planner.cost_weights["action_smooth"], 0.05)
 
-    def test_hanwam_off_fan_cost_penalizes_high_fan_when_compressor_off(self):
-        model = HanWAM(obs_dim=len(WAM_OBS_COLS), action_dim=len(WAM_ACTION_COLS), physical_dim=len(WAM_PHYSICAL_COLS), latent_dim=8, hidden_dim=16)
+    def test_hanwam_comfort_band_violation_ignores_in_band_error(self):
+        model = _tiny_hanwam()
         norm_obs = Normalizer(mean=np.zeros(len(WAM_OBS_COLS), dtype=np.float32), std=np.ones(len(WAM_OBS_COLS), dtype=np.float32))
         norm_action = Normalizer(mean=np.zeros(len(WAM_ACTION_COLS), dtype=np.float32), std=np.ones(len(WAM_ACTION_COLS), dtype=np.float32))
         norm_phys = Normalizer(mean=np.zeros(len(WAM_PHYSICAL_COLS), dtype=np.float32), std=np.ones(len(WAM_PHYSICAL_COLS), dtype=np.float32))
-        planner = CEMPlanner(
+        planner = MPPIPlanner(
             model=model,
             obs_norm=norm_obs,
             action_norm=norm_action,
             physical_norm=norm_phys,
             obs_cols=WAM_OBS_COLS,
             physical_cols=WAM_PHYSICAL_COLS,
-            action_bounds={"freq_target": (0.0, 90.0), "eev": (69.0, 480.0), "fan_out": (0.0, 850.0)},
+            action_bounds={"freq_target": (0.0, 80.0), "eev": (69.0, 480.0), "fan_out": (0.0, 900.0)},
             config={
                 "horizon_steps": 2,
                 "chunk_steps": 1,
-                "cost_weights": {"tracking": 0.0, "energy": 0.0, "action_smooth": 0.0, "off_fan": 1.0},
+                "comfort_band_c": 0.5,
+                "cost_weights": {"comfort_band_violation": 1.0, "energy": 0.0, "action_smooth": 0.0},
             },
             device=torch.device("cpu"),
         )
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
         physical = torch.zeros(2, 2, len(WAM_PHYSICAL_COLS))
-        low_fan = torch.tensor([[[0.0, 165.0, 0.0], [0.0, 165.0, 0.0]]])
-        high_fan = torch.tensor([[[0.0, 165.0, 850.0], [0.0, 165.0, 850.0]]])
-        actions = torch.cat([low_fan, high_fan], dim=0)
+        physical[0, :, idx["T_in_delta"]] = torch.tensor([-0.2, -0.2])
+        physical[1, :, idx["T_in_delta"]] = torch.tensor([0.4, 0.4])
+        actions = torch.zeros(2, 2, len(WAM_ACTION_COLS))
         observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
         observation[WAM_OBS_COLS.index("T_in")] = 27.0
         cost, parts = planner._cost(physical, actions, target=27.0, initial_t_in=27.0, remaining_seconds=None, observation=observation)
-        self.assertIn("off_fan", parts)
+        self.assertIn("comfort_band_violation", parts)
+        self.assertAlmostEqual(float(parts["comfort_band_violation"][0]), 0.0)
         self.assertLess(float(cost[0]), float(cost[1]))
 
-    def test_hanwam_action_prior_penalizes_action_z_outliers(self):
-        model = HanWAM(obs_dim=len(WAM_OBS_COLS), action_dim=len(WAM_ACTION_COLS), physical_dim=len(WAM_PHYSICAL_COLS), latent_dim=8, hidden_dim=16)
-        norm_obs = Normalizer(mean=np.zeros(len(WAM_OBS_COLS), dtype=np.float32), std=np.ones(len(WAM_OBS_COLS), dtype=np.float32))
-        norm_action = Normalizer(
-            mean=np.asarray([40.0, 165.0, 750.0], dtype=np.float32),
-            std=np.asarray([10.0, 30.0, 50.0], dtype=np.float32),
+    def test_hanwam_e055_pre_deadline_envelope_only_penalizes_upper_violation(self):
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e055_first_principles_envelope_v1",
+                "horizon_steps": 2,
+                "chunk_steps": 1,
+                "comfort_band_c": 0.45,
+                "cost_weights": {
+                    "temperature_band_c": 0.45,
+                    "thermal_envelope": 1.0,
+                    "terminal": 0.0,
+                    "energy": 0.0,
+                    "action": 0.0,
+                },
+            }
         )
-        norm_phys = Normalizer(mean=np.zeros(len(WAM_PHYSICAL_COLS), dtype=np.float32), std=np.ones(len(WAM_PHYSICAL_COLS), dtype=np.float32))
-        planner = CEMPlanner(
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(2, 2, len(WAM_PHYSICAL_COLS))
+        physical[1, :, idx["T_in_delta"]] = torch.tensor([0.6, 0.0])
+        actions = torch.zeros(2, 2, len(WAM_ACTION_COLS))
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 30.0
+
+        cost, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=30.0,
+            remaining_seconds=600.0,
+            observation=observation,
+        )
+
+        self.assertEqual(set(parts), {"thermal_envelope", "terminal", "energy", "action"})
+        self.assertAlmostEqual(float(parts["thermal_envelope"][0]), 0.0)
+        self.assertLess(float(cost[0]), float(cost[1]))
+
+    def test_hanwam_e055_post_deadline_envelope_penalizes_upper_and_lower_violation(self):
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e055_first_principles_envelope_v1",
+                "horizon_steps": 2,
+                "chunk_steps": 1,
+                "comfort_band_c": 0.45,
+                "cost_weights": {
+                    "temperature_band_c": 0.45,
+                    "thermal_envelope": 1.0,
+                    "terminal": 0.0,
+                    "energy": 0.0,
+                    "action": 0.0,
+                },
+            }
+        )
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(3, 2, len(WAM_PHYSICAL_COLS))
+        physical[1, :, idx["T_in_delta"]] = torch.tensor([0.6, 0.0])
+        physical[2, :, idx["T_in_delta"]] = torch.tensor([-0.6, 0.0])
+        actions = torch.zeros(3, 2, len(WAM_ACTION_COLS))
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 27.0
+
+        cost, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.0,
+            remaining_seconds=0.0,
+            observation=observation,
+        )
+
+        self.assertAlmostEqual(float(parts["thermal_envelope"][0]), 0.0)
+        self.assertGreater(float(parts["thermal_envelope"][1]), 0.0)
+        self.assertGreater(float(parts["thermal_envelope"][2]), 0.0)
+        self.assertLess(float(cost[0]), float(cost[1]))
+        self.assertLess(float(cost[0]), float(cost[2]))
+
+    def test_hanwam_e055_terminal_projection_penalizes_future_upper_risk(self):
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e055_first_principles_envelope_v1",
+                "horizon_steps": 4,
+                "chunk_steps": 1,
+                "terminal_guard_tail_seconds": 10.0,
+                "terminal_projection_max_seconds": 600.0,
+                "cost_weights": {
+                    "temperature_band_c": 0.45,
+                    "thermal_envelope": 0.0,
+                    "terminal": 1.0,
+                    "energy": 0.0,
+                    "action": 0.0,
+                },
+            }
+        )
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(2, 4, len(WAM_PHYSICAL_COLS))
+        physical[1, :, idx["T_in_delta"]] = torch.tensor([0.02, 0.02, 0.02, 0.02])
+        actions = torch.zeros(2, 4, len(WAM_ACTION_COLS))
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 27.2
+
+        cost, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.2,
+            remaining_seconds=0.0,
+            observation=observation,
+        )
+
+        self.assertAlmostEqual(float(parts["terminal"][0]), 0.0)
+        self.assertGreater(float(parts["terminal"][1]), 0.0)
+        self.assertLess(float(cost[0]), float(cost[1]))
+
+    def test_hanwam_e055_chunk_action_cost_is_not_diluted_by_repeated_steps(self):
+        model = _tiny_hanwam(frames_per_block=12, history_blocks=1, future_blocks=2)
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e055_first_principles_envelope_v1",
+                "frames_per_block": 12,
+                "history_blocks": 1,
+                "future_blocks": 2,
+                "horizon_steps": 24,
+                "chunk_steps": 12,
+                "cost_weights": {
+                    "thermal_envelope": 0.0,
+                    "terminal": 0.0,
+                    "energy": 0.0,
+                    "action": 1.0,
+                    "action_first_weight": 0.0,
+                    "action_sequence_weight": 1.0,
+                },
+            },
             model=model,
-            obs_norm=norm_obs,
-            action_norm=norm_action,
-            physical_norm=norm_phys,
-            obs_cols=WAM_OBS_COLS,
-            physical_cols=WAM_PHYSICAL_COLS,
-            action_bounds={"freq_target": (0.0, 90.0), "eev": (69.0, 480.0), "fan_out": (0.0, 850.0)},
-            config={
-                "horizon_steps": 2,
-                "chunk_steps": 1,
-                "cost_weights": {"tracking": 0.0, "energy": 0.0, "action_smooth": 0.0, "action_prior": 1.0},
-            },
-            device=torch.device("cpu"),
         )
-        physical = torch.zeros(2, 2, len(WAM_PHYSICAL_COLS))
-        typical = torch.tensor([[[40.0, 165.0, 750.0], [40.0, 165.0, 750.0]]])
-        outlier = torch.tensor([[[90.0, 480.0, 0.0], [90.0, 480.0, 0.0]]])
-        actions = torch.cat([typical, outlier], dim=0)
+        physical = torch.zeros(2, 24, len(WAM_PHYSICAL_COLS))
+        steady = torch.tensor([[0.0, 165.0, 0.0]] * 24)
+        jump = steady.clone()
+        jump[12:, 0] = 80.0
+        actions = torch.stack([steady, jump], dim=0)
+        history = np.asarray([[[0.0, 165.0, 0.0]] * 12], dtype=np.float32)
         observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
         observation[WAM_OBS_COLS.index("T_in")] = 27.0
-        cost, parts = planner._cost(physical, actions, target=27.0, initial_t_in=27.0, remaining_seconds=None, observation=observation)
-        self.assertIn("action_prior", parts)
-        self.assertLess(float(cost[0]), float(cost[1]))
 
-    def test_vicreg_penalizes_collapsed_latents(self):
-        collapsed = torch.zeros(16, 8)
-        varied = torch.randn(16, 8)
-        collapsed_loss = HanWAM.vicreg_loss(collapsed)[0]
-        varied_loss = HanWAM.vicreg_loss(varied)[0]
-        self.assertGreater(float(collapsed_loss), float(varied_loss))
+        _, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.0,
+            remaining_seconds=None,
+            observation=observation,
+            current_action=np.asarray([0.0, 165.0, 0.0], dtype=np.float32),
+            act_history_blocks=history,
+        )
+
+        self.assertAlmostEqual(float(parts["action"][0]), 0.0)
+        self.assertAlmostEqual(float(parts["action"][1]), 1.0 / 3.0, places=6)
+
+    def test_hanwam_e055_recent_action_reference_can_use_history_ema(self):
+        history = np.asarray(
+            [[[0.0, 165.0, 0.0]] * 11 + [[80.0, 165.0, 0.0]]],
+            dtype=np.float32,
+        )
+        mean_planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e055_first_principles_envelope_v1",
+                "frames_per_block": 12,
+                "history_blocks": 1,
+                "future_blocks": 1,
+                "horizon_steps": 12,
+                "chunk_steps": 12,
+            },
+            model=_tiny_hanwam(frames_per_block=12, history_blocks=1, future_blocks=1),
+        )
+        ema_planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e055_first_principles_envelope_v1",
+                "frames_per_block": 12,
+                "history_blocks": 1,
+                "future_blocks": 1,
+                "horizon_steps": 12,
+                "chunk_steps": 12,
+                "action_history_ema_tau_seconds": 10.0,
+            },
+            model=_tiny_hanwam(frames_per_block=12, history_blocks=1, future_blocks=1),
+        )
+
+        mean_reference = mean_planner._recent_action_reference(history, None)
+        ema_reference = ema_planner._recent_action_reference(history, None)
+
+        self.assertAlmostEqual(float(mean_reference[0]), 80.0 / 12.0, places=5)
+        self.assertGreater(float(ema_reference[0]), float(mean_reference[0]))
+        self.assertLess(float(ema_reference[0]), 80.0)
+        self.assertAlmostEqual(float(ema_reference[1]), 165.0, places=5)
+
+    def test_hanwam_e055_grouped_config_matches_flat_config(self):
+        model = _tiny_hanwam(frames_per_block=2, history_blocks=1, future_blocks=2)
+        flat_config = {
+            "objective": "hanwam_e055_first_principles_envelope_v1",
+            "frames_per_block": 2,
+            "history_blocks": 1,
+            "future_blocks": 2,
+            "horizon_steps": 4,
+            "chunk_steps": 2,
+            "step_seconds": 5,
+            "energy_reference_kwh_per_hour": 0.6,
+            "terminal_guard_tail_seconds": 10.0,
+            "terminal_projection_max_seconds": 20.0,
+            "action_history_ema_tau_seconds": 10.0,
+            "cost_weights": {
+                "temperature_band_c": 0.45,
+                "thermal_envelope": 160.0,
+                "terminal": 80.0,
+                "energy": 2.5,
+                "action": 0.5,
+                "action_first_weight": 1.0,
+                "action_sequence_weight": 1.0,
+            },
+        }
+        grouped_config = {
+            "objective": "hanwam_e055_first_principles_envelope_v1",
+            "timing": {
+                "frames_per_block": 2,
+                "history_blocks": 1,
+                "future_blocks": 2,
+                "horizon_steps": 4,
+                "chunk_steps": 2,
+                "step_seconds": 5,
+            },
+            "first_principles": {
+                "band_c": 0.45,
+                "terminal_tail_seconds": 10.0,
+                "terminal_projection_max_seconds": 20.0,
+                "energy_reference_kwh_per_hour": 0.6,
+                "action_history_ema_tau_seconds": 10.0,
+                "weights": {
+                    "thermal_envelope": 160.0,
+                    "terminal": 80.0,
+                    "energy": 2.5,
+                    "action": 0.5,
+                    "action_first_weight": 1.0,
+                    "action_sequence_weight": 1.0,
+                },
+            },
+        }
+        flat_planner = _tiny_mppi_planner(flat_config, model=model)
+        grouped_planner = _tiny_mppi_planner(grouped_config, model=model)
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(2, 4, len(WAM_PHYSICAL_COLS))
+        physical[0, :, idx["T_in_delta"]] = torch.tensor([0.02, 0.02, 0.02, 0.02])
+        physical[1, :, idx["T_in_delta"]] = torch.tensor([0.20, 0.15, 0.10, 0.10])
+        physical[:, :, idx["electric_kwh_delta"]] = torch.tensor(
+            [
+                [0.001, 0.001, 0.001, 0.001],
+                [0.002, 0.002, 0.002, 0.002],
+            ]
+        )
+        steady = torch.tensor([[20.0, 165.0, 300.0]] * 4)
+        jump = torch.tensor([[20.0, 165.0, 300.0], [20.0, 165.0, 300.0], [60.0, 165.0, 600.0], [60.0, 165.0, 600.0]])
+        actions = torch.stack([steady, jump], dim=0)
+        history = np.asarray([[[10.0, 165.0, 200.0], [20.0, 165.0, 300.0]]], dtype=np.float32)
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 27.2
+        current_action = np.asarray([20.0, 165.0, 300.0], dtype=np.float32)
+
+        flat_cost, flat_parts = flat_planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.2,
+            remaining_seconds=0.0,
+            observation=observation,
+            current_action=current_action,
+            act_history_blocks=history,
+        )
+        grouped_cost, grouped_parts = grouped_planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.2,
+            remaining_seconds=0.0,
+            observation=observation,
+            current_action=current_action,
+            act_history_blocks=history,
+        )
+
+        self.assertEqual(set(grouped_parts), {"thermal_envelope", "terminal", "energy", "action"})
+        torch.testing.assert_close(grouped_cost, flat_cost)
+        for name in flat_parts:
+            torch.testing.assert_close(grouped_parts[name], flat_parts[name])
+
+    def test_hanwam_e055_energy_normalization_uses_horizon_reference(self):
+        model = _tiny_hanwam(frames_per_block=12, history_blocks=1, future_blocks=8)
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e055_first_principles_envelope_v1",
+                "frames_per_block": 12,
+                "history_blocks": 1,
+                "future_blocks": 8,
+                "horizon_steps": 96,
+                "chunk_steps": 12,
+                "energy_reference_kwh_per_hour": 0.6,
+                "cost_weights": {
+                    "thermal_envelope": 0.0,
+                    "terminal": 0.0,
+                    "energy": 1.0,
+                    "action": 0.0,
+                },
+            },
+            model=model,
+        )
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(1, 96, len(WAM_PHYSICAL_COLS))
+        physical[0, :, idx["electric_kwh_delta"]] = 0.08 / 96.0
+        actions = torch.zeros(1, 96, len(WAM_ACTION_COLS))
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 27.0
+
+        _, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.0,
+            remaining_seconds=None,
+            observation=observation,
+        )
+
+        self.assertAlmostEqual(float(parts["energy"][0]), 1.0, places=6)
+
+    def test_hanwam_e056_post_deadline_uses_internal_running_envelope(self):
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e056_first_principles_robust_envelope_v1",
+                "horizon_steps": 2,
+                "chunk_steps": 1,
+                "first_principles": {
+                    "envelope": {
+                        "pre_deadline_band_c": 0.45,
+                        "post_deadline_upper_c": 0.20,
+                        "post_deadline_lower_c": 0.30,
+                    },
+                    "weights": {"thermal_envelope": 1.0, "terminal": 0.0, "energy": 0.0, "action": 0.0},
+                },
+            }
+        )
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(3, 2, len(WAM_PHYSICAL_COLS))
+        physical[1, :, idx["T_in_delta"]] = torch.tensor([0.25, 0.0])
+        physical[2, :, idx["T_in_delta"]] = torch.tensor([-0.35, 0.0])
+        actions = torch.zeros(3, 2, len(WAM_ACTION_COLS))
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 27.0
+
+        cost, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.0,
+            remaining_seconds=0.0,
+            observation=observation,
+        )
+
+        self.assertEqual(set(parts), {"thermal_envelope", "terminal", "energy", "action"})
+        self.assertAlmostEqual(float(parts["thermal_envelope"][0]), 0.0)
+        self.assertGreater(float(parts["thermal_envelope"][1]), 0.0)
+        self.assertGreater(float(parts["thermal_envelope"][2]), 0.0)
+        self.assertLess(float(cost[0]), float(cost[1]))
+        self.assertLess(float(cost[0]), float(cost[2]))
+
+    def test_hanwam_e056_terminal_only_runs_before_horizon_contains_deadline(self):
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e056_first_principles_robust_envelope_v1",
+                "horizon_steps": 4,
+                "chunk_steps": 1,
+                "step_seconds": 5,
+                "first_principles": {
+                    "envelope": {"pre_deadline_band_c": 0.45, "guard_seconds": 0},
+                    "terminal": {
+                        "enabled_only_before_horizon_contains_deadline": True,
+                        "tail_seconds": 10,
+                        "projection_max_seconds": 120,
+                        "slope_method": "robust_linear",
+                        "slope_clip": True,
+                        "slope_clip_c_per_min": 1.0,
+                    },
+                    "weights": {"thermal_envelope": 0.0, "terminal": 1.0, "energy": 0.0, "action": 0.0},
+                },
+            }
+        )
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(2, 4, len(WAM_PHYSICAL_COLS))
+        physical[1, :, idx["T_in_delta"]] = torch.tensor([0.10, 0.10, 0.10, 0.10])
+        actions = torch.zeros(2, 4, len(WAM_ACTION_COLS))
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 27.2
+
+        _, inside_parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.2,
+            remaining_seconds=20.0,
+            observation=observation,
+        )
+        _, outside_parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.2,
+            remaining_seconds=200.0,
+            observation=observation,
+        )
+
+        self.assertAlmostEqual(float(inside_parts["terminal"][1]), 0.0)
+        self.assertGreater(float(outside_parts["terminal"][1]), 0.0)
+
+    def test_hanwam_e056_action_reference_uses_last_issued_command(self):
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e056_first_principles_robust_envelope_v1",
+                "horizon_steps": 2,
+                "chunk_steps": 1,
+                "first_principles": {
+                    "action": {
+                        "reference": "last_issued_command",
+                        "loss": "mse",
+                        "first_weight": 1.0,
+                        "sequence_weight": 0.0,
+                    },
+                    "weights": {"thermal_envelope": 0.0, "terminal": 0.0, "energy": 0.0, "action": 1.0},
+                },
+            }
+        )
+        physical = torch.zeros(1, 2, len(WAM_PHYSICAL_COLS))
+        actions = torch.tensor([[[20.0, 165.0, 300.0], [20.0, 165.0, 300.0]]])
+        history = np.asarray([[[80.0, 300.0, 900.0], [80.0, 300.0, 900.0]]], dtype=np.float32)
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 27.0
+
+        _, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.0,
+            remaining_seconds=0.0,
+            observation=observation,
+            current_action=np.asarray([20.0, 165.0, 300.0], dtype=np.float32),
+            act_history_blocks=history,
+        )
+
+        self.assertAlmostEqual(float(parts["action"][0]), 0.0)
+
+    def test_hanwam_e056_slew_projection_limits_first_and_future_chunks(self):
+        model = _tiny_hanwam(frames_per_block=12, history_blocks=1, future_blocks=2)
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e056_first_principles_robust_envelope_v1",
+                "frames_per_block": 12,
+                "history_blocks": 1,
+                "future_blocks": 2,
+                "horizon_steps": 24,
+                "chunk_steps": 12,
+                "control_interval_steps": 2,
+                "step_seconds": 5,
+                "first_principles": {
+                    "slew": {
+                        "pre_deadline": {"freq": 8, "eev": 20, "fan_out": 100},
+                        "post_deadline": {"freq": 4, "eev": 10, "fan_out": 50},
+                    }
+                },
+            },
+            model=model,
+        )
+
+        chunks = torch.tensor([[[80.0, 300.0, 900.0], [80.0, 300.0, 900.0]]])
+        projected = planner._project_action_chunks(
+            chunks,
+            current_action=np.asarray([0.0, 165.0, 0.0], dtype=np.float32),
+            remaining_seconds=2400.0,
+        )[0]
+
+        self.assertAlmostEqual(float(projected[0, 0]), 15.0, places=5)
+        self.assertAlmostEqual(float(projected[0, 1]), 185.0, places=5)
+        self.assertAlmostEqual(float(projected[0, 2]), 100.0, places=5)
+        self.assertAlmostEqual(float(projected[1, 0]), 63.0, places=5)
+        self.assertAlmostEqual(float(projected[1, 1]), 300.0, places=5)
+        self.assertAlmostEqual(float(projected[1, 2]), 700.0, places=5)
+
+        post_chunks = torch.tensor([[[80.0, 300.0, 900.0], [0.0, 69.0, 0.0]]])
+        post_projected = planner._project_action_chunks(
+            post_chunks,
+            current_action=np.asarray([40.0, 200.0, 500.0], dtype=np.float32),
+            remaining_seconds=0.0,
+        )[0]
+
+        self.assertAlmostEqual(float(post_projected[0, 0]), 44.0, places=5)
+        self.assertAlmostEqual(float(post_projected[0, 1]), 210.0, places=5)
+        self.assertAlmostEqual(float(post_projected[0, 2]), 550.0, places=5)
+        self.assertAlmostEqual(float(post_projected[1, 0]), 20.0, places=5)
+        self.assertAlmostEqual(float(post_projected[1, 1]), 150.0, places=5)
+        self.assertAlmostEqual(float(post_projected[1, 2]), 250.0, places=5)
+
+    def test_hanwam_e057_uses_only_reach_clamp_action_parts(self):
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e057_phase_aware_clamp_v1",
+                "horizon_steps": 4,
+                "chunk_steps": 1,
+                "step_seconds": 5,
+                "first_principles": {
+                    "phase": {
+                        "reach_deadline_fraction": 0.65,
+                        "reach_band_c": 0.45,
+                        "hold_activation_c": 0.50,
+                        "clamp_upper_c": 0.20,
+                        "clamp_lower_c": 0.25,
+                    },
+                    "weights": {"reach": 1.0, "clamp": 1.0, "action": 0.0},
+                },
+            }
+        )
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(1, 4, len(WAM_PHYSICAL_COLS))
+        physical[0, :, idx["T_in_delta"]] = torch.tensor([-0.30, -0.30, -0.30, -0.30])
+        actions = torch.zeros(1, 4, len(WAM_ACTION_COLS))
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 28.0
+
+        _, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=28.0,
+            remaining_seconds=600.0,
+            observation=observation,
+        )
+
+        self.assertEqual(set(parts), {"reach", "clamp", "action"})
+
+    def test_hanwam_e060_adds_phase_energy_cost(self):
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e060_phase_energy_clamp_v1",
+                "horizon_steps": 4,
+                "chunk_steps": 1,
+                "step_seconds": 5,
+                "first_principles": {
+                    "energy": {"reference_kwh_per_hour": 0.6},
+                    "phase": {
+                        "reach_deadline_fraction": 0.65,
+                        "reach_band_c": 0.45,
+                        "hold_activation_c": 0.50,
+                        "clamp_upper_c": 0.35,
+                        "clamp_lower_c": 0.35,
+                        "clamp_center_weight": 0.0,
+                    },
+                    "weights": {
+                        "reach": 0.0,
+                        "clamp": 0.0,
+                        "energy_pre": 0.15,
+                        "energy_hold": 1.0,
+                        "energy_post": 1.5,
+                        "action_pre": 0.0,
+                        "action_hold": 0.0,
+                        "action_post": 0.0,
+                    },
+                },
+            }
+        )
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(2, 4, len(WAM_PHYSICAL_COLS))
+        energy_ref = 0.6 * (4 * 5) / 3600.0
+        physical[0, :, idx["electric_kwh_delta"]] = energy_ref / 4.0
+        physical[1, :, idx["electric_kwh_delta"]] = 2.0 * energy_ref / 4.0
+        actions = torch.zeros(2, 4, len(WAM_ACTION_COLS))
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 27.0
+
+        cost, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=27.0,
+            remaining_seconds=0.0,
+            observation=observation,
+        )
+
+        self.assertEqual(set(parts), {"reach", "clamp", "energy", "action"})
+        self.assertAlmostEqual(float(parts["energy"][0]), 1.5, places=6)
+        self.assertAlmostEqual(float(parts["energy"][1]), 3.0, places=6)
+        torch.testing.assert_close(cost, parts["energy"])
+
+    def test_hanwam_e057_switches_to_clamp_after_predicted_reach(self):
+        planner = _tiny_mppi_planner(
+            {
+                "objective": "hanwam_e057_phase_aware_clamp_v1",
+                "horizon_steps": 4,
+                "chunk_steps": 1,
+                "step_seconds": 5,
+                "first_principles": {
+                    "phase": {
+                        "reach_deadline_fraction": 1.0,
+                        "reach_band_c": 0.45,
+                        "hold_activation_c": 0.50,
+                        "clamp_upper_c": 0.20,
+                        "clamp_lower_c": 0.25,
+                    },
+                    "weights": {"reach": 0.0, "clamp": 1.0, "action": 0.0},
+                },
+            }
+        )
+        idx = {name: i for i, name in enumerate(WAM_PHYSICAL_COLS)}
+        physical = torch.zeros(2, 4, len(WAM_PHYSICAL_COLS))
+        physical[0, :, idx["T_in_delta"]] = torch.tensor([-0.10, -0.10, -0.10, -0.10])
+        physical[1, :, idx["T_in_delta"]] = torch.tensor([-0.60, -0.60, -0.60, -0.60])
+        actions = torch.zeros(2, 4, len(WAM_ACTION_COLS))
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 28.0
+
+        _, parts = planner._cost(
+            physical,
+            actions,
+            target=27.0,
+            initial_t_in=28.0,
+            remaining_seconds=600.0,
+            observation=observation,
+        )
+
+        self.assertAlmostEqual(float(parts["clamp"][0]), 0.0)
+        self.assertGreater(float(parts["clamp"][1]), 0.0)
 
     def test_sigreg_penalizes_collapsed_latents(self):
         collapsed = torch.zeros(16, 8)
         varied = torch.randn(16, 8)
-        collapsed_loss = HanWAM.sigreg_loss(collapsed, num_projections=16)[0]
-        varied_loss = HanWAM.sigreg_loss(varied, num_projections=16)[0]
+        collapsed_loss = HanWAMWorldModel.sigreg_loss(collapsed, num_projections=16)[0]
+        varied_loss = HanWAMWorldModel.sigreg_loss(varied, num_projections=16)[0]
         self.assertGreater(float(collapsed_loss), float(varied_loss))
+
+    def test_hanwam_stage1_state_dict_has_no_prober_and_stage2_freezes_world_model(self):
+        world = HanWAMWorldModel(
+            obs_dim=len(WAM_OBS_COLS),
+            action_dim=len(WAM_ACTION_COLS),
+            latent_dim=8,
+            hidden_dim=16,
+            action_latent_dim=4,
+            frames_per_block=2,
+            history_blocks=2,
+            future_blocks=2,
+        )
+        self.assertFalse(any(key.startswith("prober") for key in world.state_dict()))
+        controller = HanWAMControllerModel(world, physical_dim=len(WAM_PHYSICAL_COLS), hidden_dim=16)
+        controller.freeze_world_model()
+        self.assertFalse(any(param.requires_grad for param in controller.world_model_parameters()))
+        self.assertTrue(all(param.requires_grad for param in controller.prober_parameters()))
+
+    def test_mppi_softmax_planner_outputs_bounded_deadband_action(self):
+        model = _tiny_hanwam(frames_per_block=2, history_blocks=2, future_blocks=1)
+        norm_obs = Normalizer(mean=np.zeros(len(WAM_OBS_COLS), dtype=np.float32), std=np.ones(len(WAM_OBS_COLS), dtype=np.float32))
+        norm_action = Normalizer(mean=np.zeros(len(WAM_ACTION_COLS), dtype=np.float32), std=np.ones(len(WAM_ACTION_COLS), dtype=np.float32))
+        norm_phys = Normalizer(mean=np.zeros(len(WAM_PHYSICAL_COLS), dtype=np.float32), std=np.ones(len(WAM_PHYSICAL_COLS), dtype=np.float32))
+        planner = MPPIPlanner(
+            model=model,
+            obs_norm=norm_obs,
+            action_norm=norm_action,
+            physical_norm=norm_phys,
+            obs_cols=WAM_OBS_COLS,
+            physical_cols=WAM_PHYSICAL_COLS,
+            action_bounds={"freq_target": (0.0, 80.0), "eev": (69.0, 480.0), "fan_out": (0.0, 900.0)},
+            config={
+                "horizon_steps": 2,
+                "frames_per_block": 2,
+                "future_blocks": 1,
+                "history_blocks": 2,
+                "chunk_steps": 1,
+                "num_samples": 8,
+                "num_iterations": 1,
+                "temperature": 1.0,
+                "cost_weights": {"energy": 0.0, "action_smooth": 0.0},
+            },
+            device=torch.device("cpu"),
+        )
+        observation = np.zeros(len(WAM_OBS_COLS), dtype=np.float32)
+        observation[WAM_OBS_COLS.index("T_in")] = 27.0
+        obs_hist = np.zeros((2, 2, len(WAM_OBS_COLS)), dtype=np.float32)
+        act_hist = np.zeros((2, 2, len(WAM_ACTION_COLS)), dtype=np.float32)
+        result = planner.plan(
+            observation,
+            target=27.0,
+            obs_history_blocks=obs_hist,
+            act_history_blocks=act_hist,
+            current_action=np.asarray([10.0, 165.0, 750.0], dtype=np.float32),
+        )
+        self.assertEqual(result.debug["hanwam_planner"], "mppi")
+        self.assertGreaterEqual(float(result.action[0]), 0.0)
+        self.assertLessEqual(float(result.action[0]), 80.0)
+        self.assertTrue(float(result.action[0]) == 0.0 or float(result.action[0]) >= 15.0)
 
     def test_swanlab_disabled_does_not_import(self):
         before = dict(sys.modules)

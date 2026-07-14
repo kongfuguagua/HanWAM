@@ -9,7 +9,7 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_PATH = PROJECT_ROOT / "control" / "HanWAM" / "config" / "hanwam.yml"
+CONFIG_PATH = PROJECT_ROOT / "control" / "HanWAM" / "config" / "hanwam_e065_lowfreq10_positive_eev_energy_v1.yml"
 VALID_METHODS = {"historical", "fixed", "pid", "hanwam"}
 VALID_STAGES = {"env_check", "test", "train", "eval"}
 VALID_MODES = {1, 3}
@@ -54,20 +54,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "columns": {
             "timestamp": "ts",
             "observation": [
-                "T_out",
-                "T_out_coil",
-                "T_in",
-                "T_in_coil",
-                "freq_target",
                 "freq",
-                "eev",
                 "fan_out",
                 "fan_in",
-                "RH_in",
+                "eev",
+                "T_out_coil",
+                "T_in_coil",
+                "T_out_discharge",
+                "T_in",
+                "T_out",
+                "energy_cum",
                 "T_set",
                 "mode",
-                "energy_cum",
-                "elapsed_seconds",
             ],
             "target_action": ["freq_target", "eev", "fan_out"],
             "actual_action": ["freq", "eev", "fan_out"],
@@ -77,7 +75,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "simulator": {
         "air_conditioner": {
             "step_seconds": CONTROL_STEP_SECONDS,
-            "freq_cap_by_mode": {"1": 90.0, "3": 110.0},
+            "freq_cap_by_mode": {"1": 80.0, "3": 110.0},
             "freq_params": {},
         },
         "environment": {
@@ -94,7 +92,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "device": "auto",
         "epochs": 40,
         "batch_size": 4096,
-        "horizon_steps": 60,
+        "frames_per_block": 12,
+        "history_blocks": 3,
+        "future_blocks": 5,
         "lr": 0.001,
         "weight_decay": 0.0001,
         "limit_transitions": 0,
@@ -111,28 +111,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "method": {
         "name": "hanwam",
-        "checkpoint_template": "control/HanWAM/checkpoints/hanwam_mode{mode}.pt",
-        "model": {"class_name": "HanWAM", "latent_dim": 64, "hidden_dim": 128},
+        "checkpoint_template": "control/HanWAM/checkpoints/hanwam_e027_hard_mechanism_energy_balance_v1_mode{mode}.pt",
+        "model": {"class_name": "HanWAMHardMechanismControllerModel", "latent_dim": 96, "hidden_dim": 192},
         "planner": {
-            "objective": "hanwam_simple",
-            "horizon_steps": 24,
-            "chunk_steps": 6,
-            "num_samples": 128,
+            "objective": "hanwam_e057_phase_aware_clamp_v1",
+            "chunk_steps": 12,
+            "control_interval_steps": 6,
+            "num_samples": 512,
             "num_iterations": 3,
-            "elite_ratio": 0.1,
+            "temperature": 0.7,
             "step_seconds": CONTROL_STEP_SECONDS,
             "reference_schedule": "deadline_linear",
+            "comfort_band_reference": "schedule_then_target",
             "deadline_fraction": 0.3,
+            "target_band_margin_seconds": 600,
+            "comfort_band_c": 0.45,
+            "target_margin_comfort_band_c": 0.45,
+            "deadline_comfort_band_c": 0.45,
             "compressor_on_threshold_hz": 15.0,
             "snap_deadband_freq": True,
             "cost_weights": {
-                "tracking": 4.0,
-                "energy": 2.0,
-                "action_smooth": 0.05,
+                "comfort_band_violation": 8.0,
+                "target_margin_band_violation": 24.0,
+                "deadline_band_violation": 120.0,
+                "energy": 16.0,
+                "action_smooth": 0.20,
             },
         },
         "action_space_by_mode": {
-            "1": {"freq_target": [0.0, 90.0], "eev": [69.0, 480.0], "fan_out": [0.0, 850.0]},
+            "1": {"freq_target": [0.0, 80.0], "eev": [69.0, 480.0], "fan_out": [0.0, 900.0]},
             "3": {"freq_target": [0.0, 110.0], "eev": [100.0, 480.0], "fan_out": [0.0, 800.0]},
         },
         "base_action_by_mode": {

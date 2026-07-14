@@ -1,0 +1,117 @@
+syntax = "v1"
+
+// 健康检查响应：只表示 HTTP 服务进程存活，不代表模型已经加载成功。
+type HealthResp {
+    // ok 表示服务进程可响应。
+    Status string `json:"status"`
+}
+
+// 就绪检查响应：表示控制器 adapter、checkpoint、配置已经加载成功。
+type ReadyResp {
+    // ready 表示可以接收控制请求。
+    Status string `json:"status"`
+    // 当前服务配置实例化的控制器类型，例如 hanwam_wm_mpc。
+    ControllerType string `json:"controller_type"`
+    // 模型标识，通常为算法实验名 + checkpoint sha256 前缀。
+    ModelId string `json:"model_id"`
+}
+
+// 重置响应：清空所有设备的控制会话状态，但不卸载模型。
+type ResetResp {
+    // ok 表示状态已清空。
+    Status string `json:"status"`
+    // 当前服务配置实例化的控制器类型。
+    ControllerType string `json:"controller_type"`
+    // 本次清理掉的 unit_id 会话数量。
+    SessionsCleared int `json:"sessions_cleared"`
+    // API 响应 schema 版本。
+    SchemaVersion string `json:"schema_version"`
+}
+
+// 单次控制规划请求。
+// 当前 hanwam_wm_mpc adapter 要求 obs_history 和 act_history 都是最近 36 帧，
+// 按 oldest -> newest 排序，采样间隔 step_seconds=5。
+type PlanReq {
+    // 请求 ID，由上位机生成；服务原样返回，便于链路追踪。
+    RequestId string `json:"request_id,optional"`
+    // 空调/设备 ID；弱状态服务按 unit_id 隔离 MPPI nominal 序列和 30 秒缓存动作，必填。
+    UnitId string `json:"unit_id"`
+    // 可选。省略时使用服务 YAML 中配置的 controller.type。
+    ControllerType string `json:"controller_type,optional"`
+    // 工作模式。当前 hanwam_wm_mpc 第一版只支持制冷 mode=1。
+    Mode int `json:"mode"`
+    // 控制采样间隔，单位秒。当前 HanWAM checkpoint 固定为 5。
+    StepSeconds int `json:"step_seconds"`
+    // 目标室内干球温度，单位摄氏度。
+    TargetTemperatureC float64 `json:"target_temperature_c"`
+    // 当前控制任务已经运行的时间，单位秒。
+    ElapsedSeconds float64 `json:"elapsed_seconds"`
+    // 兼容字段；HanWAM 会记录该值，但默认使用首帧自动计算的 DDL。
+    DeadlineSeconds float64 `json:"deadline_seconds,optional"`
+    // 观测历史。每个 map 的 key 必须包含 HanWAM 12 维 observation schema。
+    ObsHistory []map[string]float64 `json:"obs_history"`
+    // 动作历史。每个 map 的 key 必须包含 freq_target、eev、fan_out。
+    ActHistory []map[string]float64 `json:"act_history"`
+    // true 时返回 planner cost、耗时等调试字段；生产可设为 false。
+    ReturnDebug bool `json:"return_debug"`
+}
+
+// 单次控制规划响应。
+type PlanResp {
+    // ok 表示成功。
+    Status string `json:"status"`
+    // 原样返回请求 ID。
+    RequestId string `json:"request_id,optional"`
+    // 原样返回设备 ID。
+    UnitId string `json:"unit_id,optional"`
+    // 实际处理请求的控制器类型。
+    ControllerType string `json:"controller_type"`
+    // 模型标识。
+    ModelId string `json:"model_id"`
+    // 下发动作。当前 HanWAM 为 freq_target、eev、fan_out。
+    Action map[string]float64 `json:"action"`
+    // 动作建议有效期，单位秒。当前为 5 秒。
+    ValidForSeconds int `json:"valid_for_seconds"`
+    // API 响应 schema 版本。
+    SchemaVersion string `json:"schema_version"`
+}
+
+// 元数据响应。实际 JSON 会包含 service、logging、controller 三块详细信息。
+type MetadataResp {
+    Status string `json:"status"`
+}
+
+// 显式错误响应。服务不会自动 fallback；只有同一个 unit_id 的正常控制周期会复用 planner 缓存动作。
+type ErrorResp {
+    // error 表示失败。
+    Status string `json:"status"`
+    // 如请求体中有 request_id，则原样返回。
+    RequestId string `json:"request_id,optional"`
+    // 机器可读错误码，例如 VALIDATION_ERROR、UNSUPPORTED_REQUEST、CONFIG_ERROR。
+    ErrorCode string `json:"error_code"`
+    // 人类可读错误说明。
+    Message string `json:"message"`
+}
+
+// 通用控制 API 服务。
+service control-api {
+    // 进程健康检查。
+    @handler health
+    get /healthz returns (HealthResp)
+
+    // 模型和控制器就绪检查。
+    @handler ready
+    get /readyz returns (ReadyResp)
+
+    // 查询服务配置摘要、控制器 schema、checkpoint 标识、动作边界等。
+    @handler metadata
+    get /v1/metadata returns (MetadataResp)
+
+    // 请求一次控制动作。服务按 unit_id 弱状态维护 MPPI warm start；上位机仍必须携带完整历史窗口。
+    @handler plan
+    post /v1/plan (PlanReq) returns (PlanResp)
+
+    // 清空所有 unit_id 控制会话状态，用于实验切换、设备重启或人工恢复。
+    @handler reset
+    post /v1/reset returns (ResetResp)
+}

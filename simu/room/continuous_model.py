@@ -1,7 +1,7 @@
 """V3 continuous cooling-room feature and heat-state definitions."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -19,6 +19,18 @@ RAW_COLUMNS = [
 CONTROL_COLUMNS = ["compressor_frequency", "eev_opening", "outdoor_fan_speed"]
 STATE_COLUMNS = [c for c in RAW_COLUMNS if c not in {"ts", *CONTROL_COLUMNS}]
 STATE_INDEX = {name: index for index, name in enumerate(STATE_COLUMNS)}
+
+# Plant-model inputs: actual measurements and controls only.
+# Target / setpoint variables (T_set, indoor_fan_target, RH_target, pid_*)
+# are intentionally excluded so the learned simulator remains a pure plant
+# model and does not inherit controller intent.
+PLANT_STATE_COLUMNS = [
+    "T_out", "T_out_coil", "T_out_discharge",
+    "T_in", "T_in_coil", "RH_in",
+    "mode", "energy_cum", "fault", "swing",
+    "inference_freq", "inference_eev", "inference_fan_out", "inference_fan_in",
+]
+PLANT_STATE_INDEX = {name: index for index, name in enumerate(PLANT_STATE_COLUMNS)}
 
 
 @dataclass
@@ -78,6 +90,22 @@ class StandardHeatLoadServo:
         self.mean_load += (self.load_proxy - self.mean_load) / self.steps
 
 
+@dataclass
+class FeatureConfig:
+    """Which physics-aware feature batches are enabled.
+
+    Features are grouped so they can be ablated during training.
+    Energy-derived features are intentionally excluded.
+    """
+
+    batch1_control_memory: bool = True  # freq integrals, duty cycle, freq EWM
+    batch2_approach_temps: bool = True  # T_in-T_in_coil / T_out-T_out_coil EWMs
+    batch3_interactions: bool = True  # (T_in - T_out) * freq, RH_in * approach
+
+    def as_tuple(self) -> tuple[bool, bool, bool]:
+        return (self.batch1_control_memory, self.batch2_approach_temps, self.batch3_interactions)
+
+
 class ControlPrefixFeatures:
     def __init__(self, dt: float = DT_SECONDS):
         self.dt = float(dt)
@@ -94,6 +122,10 @@ class ControlPrefixFeatures:
             self.ewm_fast = u.copy(); self.ewm_slow = u.copy()
             self.abs_delta_total = np.zeros(3)
             self.on_steps = float(u[0] > 1.0)
+            # Time-decaying integrals for compressor frequency (index 0).
+            self.freq_integral_60 = 0.0
+            self.freq_integral_300 = 0.0
+            self.freq_integral_600 = 0.0
         else:
             delta = u - self.last
             self.abs_delta_total += np.abs(delta); self.last = u.copy()
@@ -105,30 +137,51 @@ class ControlPrefixFeatures:
             self.ewm_fast += a_fast * (u - self.ewm_fast)
             self.ewm_slow += a_slow * (u - self.ewm_slow)
             self.on_steps += float(u[0] > 1.0)
+            # Decaying integrals: sum of freq * dt with exponential forgetting.
+            for tau, attr in ((60.0, "freq_integral_60"),
+                              (300.0, "freq_integral_300"),
+                              (600.0, "freq_integral_600")):
+                alpha = 1.0 - np.exp(-self.dt / tau)
+                current = getattr(self, attr)
+                setattr(self, attr, current + alpha * (u[0] - current))
         self.n += 1
 
-    def features(self) -> np.ndarray:
+    def features(self, config: FeatureConfig | None = None) -> np.ndarray:
         if self.n == 0:
             raise RuntimeError("update a control before requesting features")
+        config = config or FeatureConfig()
         mean = self.total / self.n
         variance = np.maximum(0.0, self.total_sq / self.n - mean * mean)
         interactions = np.asarray([
             mean[0] * mean[2], mean[0] / (abs(mean[1]) + 20.0),
             self.on_steps / self.n,
         ])
-        return np.concatenate([
+        base = [
             self.last, self.first, mean, np.sqrt(variance), self.minimum,
             self.maximum, self.ewm_fast, self.ewm_slow,
             self.abs_delta_total / max(1, self.n - 1), interactions,
-        ]).astype(np.float32)
+        ]
+        if config.batch1_control_memory:
+            base.extend([
+                np.asarray([
+                    self.freq_integral_60,
+                    self.freq_integral_300,
+                    self.freq_integral_600,
+                    self.on_steps / self.n,
+                    self.ewm_fast[0],
+                    self.ewm_slow[0],
+                ], np.float64),
+            ])
+        return np.concatenate(base).astype(np.float32)
 
 
-def base_feature(initial_state: np.ndarray, prefix: ControlPrefixFeatures) -> np.ndarray:
+def base_feature(initial_state: np.ndarray, prefix: ControlPrefixFeatures,
+                 config: FeatureConfig | None = None) -> np.ndarray:
     elapsed = prefix.n * prefix.dt
     return np.concatenate([
         initial_state.astype(np.float32),
         np.asarray([elapsed / 3600.0, np.log1p(elapsed / 60.0)], np.float32),
-        prefix.features(),
+        prefix.features(config),
     ])
 
 
@@ -141,6 +194,10 @@ class ContinuousFeatureState:
 
     def update(self, control: Sequence[float]) -> None:
         self.base.update(control)
+
+    def update_temperature(self, t_in: float) -> None:
+        """Update the cached initial T_in (for stateful inference variants)."""
+        self.initial_state[STATE_INDEX["T_in"]] = float(t_in)
 
     def feature(self) -> np.ndarray:
         state = self.initial_state
@@ -158,6 +215,79 @@ class ContinuousFeatureState:
         ]).astype(np.float32)
 
 
+class AutoregressiveFeatureState:
+    """Stateful plant-model feature builder.
+
+    Uses only actual plant state and control history. Setpoints/targets
+    (``T_set``, ``indoor_fan_target``, ``RH_target``, ``pid_*``) are
+    intentionally excluded so the learned simulator remains a pure plant
+    model and responds only to the three physical controls.
+    """
+
+    def __init__(self, initial_state: np.ndarray,
+                 config: FeatureConfig | None = None):
+        self.initial_state = np.asarray(initial_state, np.float32)
+        self.current_state = self.initial_state.copy()
+        self.base = ControlPrefixFeatures(DT_SECONDS)
+        self.config = config or FeatureConfig()
+        # Approach-temperature EWMs (batch 2).
+        self.approach_in_coil_ewm = 0.0
+        self.approach_out_coil_ewm = 0.0
+
+    def update_control(self, control: Sequence[float]) -> None:
+        self.base.update(control)
+
+    def update(self, control: Sequence[float]) -> None:
+        """Alias for ``update_control`` for API compatibility."""
+        self.update_control(control)
+
+    def update_temperature(self, t_in: float) -> None:
+        self.current_state[PLANT_STATE_INDEX["T_in"]] = float(t_in)
+
+    def feature(self) -> np.ndarray:
+        state = self.current_state
+        t_in = float(state[PLANT_STATE_INDEX["T_in"]])
+        t_out = float(state[PLANT_STATE_INDEX["T_out"]])
+        t_coil_in = float(state[PLANT_STATE_INDEX["T_in_coil"]])
+        t_coil_out = float(state[PLANT_STATE_INDEX["T_out_coil"]])
+        rh_in = float(state[PLANT_STATE_INDEX["RH_in"]])
+
+        # Update approach-temperature EWMs when temperature is refreshed.
+        approach_in = t_in - t_coil_in
+        approach_out = t_out - t_coil_out
+        a_fast = 1.0 - np.exp(-self.base.dt / 30.0)
+        a_slow = 1.0 - np.exp(-self.base.dt / 300.0)
+        if self.base.n > 0:
+            self.approach_in_coil_ewm += a_fast * (approach_in - self.approach_in_coil_ewm)
+            self.approach_out_coil_ewm += a_slow * (approach_out - self.approach_out_coil_ewm)
+
+        deltas = np.asarray([
+            t_in - t_out,
+            t_in - t_coil_in,
+            t_in - t_coil_out,
+            t_out - t_coil_out,
+        ], np.float32)
+        elapsed = self.base.n * self.base.dt
+        features = [
+            state.astype(np.float32),
+            deltas,
+            np.asarray([elapsed / 3600.0, np.log1p(elapsed / 60.0)], np.float32),
+            self.base.features(self.config),
+        ]
+        if self.config.batch2_approach_temps:
+            features.append(np.asarray([
+                self.approach_in_coil_ewm,
+                self.approach_out_coil_ewm,
+            ], np.float32))
+        if self.config.batch3_interactions:
+            # Interactions use current state and latest control.
+            freq = float(self.base.last[0]) if self.base.n > 0 else 0.0
+            features.append(np.asarray([
+                (t_in - t_out) * freq,
+                rh_in * approach_in,
+            ], np.float32))
+        return np.concatenate(features).astype(np.float32)
+
+
 # Backward-compatible internal name while V3 files are migrated.
 V3FeatureState = ContinuousFeatureState
-

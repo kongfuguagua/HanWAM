@@ -13,13 +13,7 @@ import pandas as pd
 
 
 DEFAULT_EXPERIMENTS = [
-    "hanwam_design_validation",
-    "hanwam_large_v1",
-    "hanwam_large_v1_offfan003_eval",
-    "hanwam_large_v1_actionprior005_eval",
-    "hanwam_large_v1_actionprior003_fan0_eval",
-    "hanwam_medium_v1",
-    "hanwam_design_validation_deploycost_eval",
+    "hanwam_e059_soft_clamp_strong_anchor_v1",
 ]
 
 
@@ -27,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Save visual debug plots for HanWAM rollout directories")
     parser.add_argument("--outputs-root", type=Path, default=Path("control/outputs"))
     parser.add_argument("--experiment", action="append", default=None, help="Experiment name. May be repeated.")
-    parser.add_argument("--scenario", default="one_four_hour")
+    parser.add_argument("--scenario", default="standard_A_4h")
     parser.add_argument("--mode", default="mode1")
     return parser.parse_args()
 
@@ -43,19 +37,18 @@ def _plot_optional(ax, minutes: np.ndarray, frame: pd.DataFrame, col: str, *, la
         ax.plot(minutes, frame[col].to_numpy(dtype=float), label=label or col, **kwargs)
 
 
-def plot_rollout(rollout_dir: Path) -> Path | None:
-    trajectory_path = rollout_dir / "trajectories.csv"
-    controller_path = rollout_dir / "controller_log.csv"
-    if not trajectory_path.exists():
-        return None
-    trajectory = pd.read_csv(trajectory_path, encoding="utf-8-sig").sort_values("elapsed_seconds")
-    controller = pd.read_csv(controller_path, encoding="utf-8-sig").sort_values("elapsed_seconds") if controller_path.exists() else pd.DataFrame()
+def _safe_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+
+
+def _plot_frame(trajectory: pd.DataFrame, controller: pd.DataFrame, path: Path, title: str) -> Path:
+    trajectory = trajectory.sort_values("elapsed_seconds")
+    controller = controller.sort_values("elapsed_seconds") if not controller.empty else controller
     minutes = trajectory["elapsed_seconds"].to_numpy(dtype=float) / 60.0
     electric_cum = _safe_cumsum(trajectory, "electric_kwh")
     thermal_cum = _safe_cumsum(trajectory, "thermal_kwh")
 
     fig, axes = plt.subplots(7, 1, figsize=(14, 18), sharex=True)
-    title = "/".join(rollout_dir.parts[-4:])
 
     _plot_optional(axes[0], minutes, trajectory, "T_in", label="T_in", lw=1.7)
     _plot_optional(axes[0], minutes, trajectory, "target_T_in", label="target", lw=1.2, ls="--")
@@ -118,10 +111,31 @@ def plot_rollout(rollout_dir: Path) -> Path | None:
         ax.legend(loc="best", fontsize=8, ncol=3)
     fig.suptitle(title)
     fig.tight_layout(rect=(0, 0, 1, 0.985))
-    out = rollout_dir / "rollout_debug.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(path, dpi=150)
     plt.close(fig)
-    return out
+    return path
+
+
+def plot_rollout(rollout_dir: Path) -> list[Path]:
+    trajectory_path = rollout_dir / "trajectories.csv"
+    controller_path = rollout_dir / "controller_log.csv"
+    if not trajectory_path.exists():
+        return []
+    trajectory = pd.read_csv(trajectory_path, encoding="utf-8-sig")
+    controller = pd.read_csv(controller_path, encoding="utf-8-sig") if controller_path.exists() else pd.DataFrame()
+    paths: list[Path] = []
+    if "run" in trajectory and trajectory["run"].nunique() > 1:
+        for run, frame in trajectory.groupby("run", sort=False):
+            controller_frame = (
+                controller[controller["run"] == run]
+                if not controller.empty and "run" in controller
+                else pd.DataFrame()
+            )
+            path = rollout_dir / f"rollout_debug_{_safe_name(str(run))}.png"
+            paths.append(_plot_frame(frame, controller_frame, path, f"{'/'.join(rollout_dir.parts[-4:])}/{run}"))
+        return paths
+    paths.append(_plot_frame(trajectory, controller, rollout_dir / "rollout_debug.png", "/".join(rollout_dir.parts[-4:])))
+    return paths
 
 
 def main() -> None:
@@ -129,11 +143,12 @@ def main() -> None:
     experiments = args.experiment or DEFAULT_EXPERIMENTS
     for experiment in experiments:
         rollout_dir = args.outputs_root / experiment / args.scenario / args.mode
-        image = plot_rollout(rollout_dir)
-        if image is None:
+        images = plot_rollout(rollout_dir)
+        if not images:
             print(f"[skip] missing trajectories.csv: {rollout_dir}")
             continue
-        print(f"[ok] {image}")
+        for image in images:
+            print(f"[ok] {image}")
 
 
 if __name__ == "__main__":

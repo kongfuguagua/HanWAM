@@ -20,16 +20,20 @@ from ..simulator import ContinuousEnthalpyRoomEnv
 from .data_pipeline import assign_groupwise_splits, discover_cooling_runs
 
 
-def simulate_all_batched(model_path: Path, runs: list[dict]) -> list[dict]:
+def simulate_all_batched(model_path: Path, runs: list[dict], use_physics_offcycle: bool = True) -> list[dict]:
     """Closed-loop simulation with one batched model call per 5 s clock tick."""
     payload = joblib.load(model_path)
     model = payload["model"]
     if int(payload.get("supported_mode", 1)) != 1:
         raise ValueError(f"{model_path} is not a cooling model")
 
+    feature_variant = str(payload.get("feature_variant", "thermal_inertia"))
+
     contexts: list[dict] = []
     for run in runs:
-        simulator = ContinuousEnthalpyRoomEnv(model_path)
+        simulator = ContinuousEnthalpyRoomEnv(
+            model_path, use_physics_offcycle=use_physics_offcycle,
+        )
         simulator.reset(run["frame"].iloc[0])
         contexts.append({
             "run": run,
@@ -48,16 +52,41 @@ def simulate_all_batched(model_path: Path, runs: list[dict]) -> list[dict]:
             if step >= len(context["controls"]):
                 continue
             simulator = context["simulator"]
+            if feature_variant.startswith("autoregressive"):
+                simulator.prefix.update_temperature(simulator.temperature)
             simulator.prefix.update(context["controls"][step])
             feature = simulator.prefix.feature()
             features.append(feature)
             active.append(context)
 
-        offsets = model.predict(np.asarray(features, dtype=np.float32))
-        for context, offset in zip(active, offsets):
+        predictions = model.predict(np.asarray(features, dtype=np.float32))
+        for context, prediction in zip(active, predictions):
             simulator = context["simulator"]
-            direct_target = simulator.reference_temperature + float(offset)
-            simulator._advance_temperature(direct_target)
+            if feature_variant.startswith("autoregressive"):
+                freq = float(context["controls"][step][0])
+                horizon = max(1, simulator.autoregressive_horizon)
+                if simulator.use_physics_offcycle and freq <= simulator.freq_zero_threshold:
+                    dT = (
+                        simulator.offcycle_b * (simulator._outdoor_temperature - simulator.temperature)
+                        + simulator.offcycle_c
+                    ) * (simulator.dt / 60.0)
+                    simulator.temperature = float(np.clip(simulator.temperature + dT, -30.0, 65.0))
+                elif "_delta" in feature_variant:
+                    dT = float(prediction) / horizon
+                    if simulator.max_rate_c_per_min is not None:
+                        max_step = simulator.max_rate_c_per_min * simulator.dt / 60.0
+                        dT = float(np.clip(dT, -max_step, max_step))
+                    simulator.temperature = float(np.clip(simulator.temperature + dT, -30.0, 65.0))
+                else:
+                    target = float(prediction)
+                    delta = (target - simulator.temperature) / horizon
+                    if simulator.max_rate_c_per_min is not None:
+                        max_step = simulator.max_rate_c_per_min * simulator.dt / 60.0
+                        delta = float(np.clip(delta, -max_step, max_step))
+                    simulator.temperature = float(np.clip(simulator.temperature + delta, -30.0, 65.0))
+            else:
+                direct_target = simulator.reference_temperature + float(prediction)
+                simulator._advance_temperature(direct_target)
             simulator.heat_load.update(simulator.temperature, simulator.dt)
             heat_features = simulator.heat_load.features()
             context["temperature"].append(simulator.temperature)
@@ -156,6 +185,11 @@ def main() -> None:
         "--output-dir", type=Path,
         default=Path("simu/room/output/cooling_v3_all_runs"),
     )
+    parser.add_argument(
+        "--no-physics-offcycle", action="store_false", dest="use_physics_offcycle",
+        help="Disable the off-cycle physics fallback and use the ML model only.",
+    )
+    parser.set_defaults(use_physics_offcycle=True)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -169,7 +203,7 @@ def main() -> None:
         assign_groupwise_splits(runs)
     print(f"cooling runs: {len(runs)}")
 
-    contexts = simulate_all_batched(args.model, runs)
+    contexts = simulate_all_batched(args.model, runs, args.use_physics_offcycle)
     rows = [save_run_plot(context, args.output_dir) for context in contexts]
     metrics = pd.DataFrame(rows).sort_values(["split", "group", "run"])
     metrics.to_csv(args.output_dir / "metrics_all_cooling_runs.csv",

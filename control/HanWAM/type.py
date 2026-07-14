@@ -8,23 +8,25 @@ import numpy as np
 
 # Online-observable inputs confirmed for AC deployment.
 WAM_OBS_COLS = [
-    "T_in",
-    "T_set",
-    "mode",
-    "freq_target",
     "freq",
-    "eev",
     "fan_out",
-    "elapsed_seconds",
+    "fan_in",
+    "eev",
+    "T_out_coil",
+    "T_in_coil",
+    "T_out_discharge",
+    "T_in",
     "T_out",
     "energy_cum",
+    "T_set",
+    "mode",
 ]
 
 # Controls that the HanWAM planner is allowed to optimize.
 WAM_ACTION_COLS = ["freq_target", "eev", "fan_out"]
 
 # Physical quantities decoded from latent state for planning costs.
-WAM_PHYSICAL_COLS = ["T_in", "freq", "T_in_delta", "electric_kwh_delta"]
+WAM_PHYSICAL_COLS = ["T_in_delta", "electric_kwh_delta"]
 
 # Extra columns needed to build trajectories, simulator initial state, and targets.
 WAM_REQUIRED_RAW_COLS = sorted(
@@ -33,6 +35,7 @@ WAM_REQUIRED_RAW_COLS = sorted(
             "ts",
             "T_out",
             "T_out_coil",
+            "T_out_discharge",
             "T_in",
             "T_in_coil",
             "freq",
@@ -51,12 +54,11 @@ WAM_REQUIRED_RAW_COLS = sorted(
 
 
 @dataclass
-class HanWAMSequenceArrays:
-    obs_history: np.ndarray
-    actions: np.ndarray
-    future_obs_history: np.ndarray
+class HanWAMBlockSequenceArrays:
+    obs_history_blocks: np.ndarray
+    act_history_blocks: np.ndarray
+    future_act_blocks: np.ndarray
+    target_obs_blocks: np.ndarray
     physical: np.ndarray
     keys: list[str]
-
-
-WAMSequenceArrays = HanWAMSequenceArrays
+WAMBlockSequenceArrays = HanWAMBlockSequenceArrays

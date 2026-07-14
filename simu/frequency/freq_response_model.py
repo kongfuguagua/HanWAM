@@ -39,7 +39,7 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "output"
 DT = 5.0  # 采样周期
 T_DEAD_SEC_DEFAULT = 5.0  # 死区(1 个采样步)
-FREQ_MAX = 90.0
+FREQ_MAX = 80.0
 FREQ_MIN = 0.0
 ON_THRESHOLD = 15.0  # 冷启动判定
 
@@ -208,18 +208,19 @@ def fit_tau_step(up_events: list, down_events: list) -> tuple[float, float, list
 # 5 个状态:off / cold_start / up / down / clamped
 def classify_state(prev_freq: float, prev_target: float, target: float,
                    I_comp: float = 0.0, I_max: float = 3.0,
-                   freq_cap: float = None) -> str:
+                   freq_cap: float = None,
+                   on_threshold: float = ON_THRESHOLD) -> str:
     """状态分类(5 状态):off | cold_start | up | down | clamped | hold
 
     限幅触发条件(任一):
       - I_comp ≥ I_max(电流饱和)
       - prev_freq ≥ freq_cap - 1(硬件 freq 上限)
     """
-    if target < ON_THRESHOLD and prev_target >= ON_THRESHOLD:
+    if target < on_threshold and prev_target >= on_threshold:
         return "off"
-    if target < ON_THRESHOLD:
+    if target < on_threshold:
         return "off"
-    if prev_freq < 5.0 and target >= ON_THRESHOLD:
+    if prev_freq < 5.0 and target >= on_threshold:
         return "cold_start"
     # 限幅:freq 达到硬件上限 或 电流饱和
     is_clamped = False
@@ -245,7 +246,8 @@ def simulate_freq(target_seq: np.ndarray,
                   freq_cap: float = None,
                   t_dead_cold_sec: float = 5.0,
                   t_dead_steady_sec: float = 0.0,
-                  dt: float = DT, freq_max: float = FREQ_MAX) -> np.ndarray:
+                  dt: float = DT, freq_max: float = FREQ_MAX,
+                  on_threshold: float = ON_THRESHOLD) -> np.ndarray:
     """完整公式前向仿真(5 状态机)。
 
     状态机:
@@ -270,8 +272,8 @@ def simulate_freq(target_seq: np.ndarray,
     in_dead_cold = np.zeros(n, dtype=bool)
     in_dead_steady = np.zeros(n, dtype=bool)
     for t in range(1, n):
-        is_off_to_on = (target_seq[t - 1] < ON_THRESHOLD and target_seq[t] >= ON_THRESHOLD)
-        is_on_to_off = (target_seq[t - 1] >= ON_THRESHOLD and target_seq[t] < ON_THRESHOLD)
+        is_off_to_on = (target_seq[t - 1] < on_threshold and target_seq[t] >= on_threshold)
+        is_on_to_off = (target_seq[t - 1] >= on_threshold and target_seq[t] < on_threshold)
         is_jump = abs(target_seq[t] - target_seq[t - 1]) > 5.0
         if is_off_to_on:
             dead_until = t + int(t_dead_cold_sec / dt)
@@ -289,7 +291,8 @@ def simulate_freq(target_seq: np.ndarray,
         I_now = float(I_comp_seq[t]) if I_comp_seq is not None else 0.0
         # 状态分类
         state = classify_state(freq[t - 1], target_seq[t - 1], target_seq[t],
-                                I_comp=I_now, I_max=I_max, freq_cap=freq_cap)
+                                I_comp=I_now, I_max=I_max, freq_cap=freq_cap,
+                                on_threshold=on_threshold)
         if state == "off":
             freq[t] = 0.0
         elif state == "cold_start":

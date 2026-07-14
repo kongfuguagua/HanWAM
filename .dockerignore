@@ -1,0 +1,16 @@
+.git
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+control/outputs/
+control/HanWAM/results/
+data/raw/
+data/dataset/
+
+*.png
+*.csv
+*.log
+*.ipynb

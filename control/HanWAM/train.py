@@ -1,7 +1,7 @@
-"""Strict two-stage HanWAM training.
+"""Strict two-stage HanWAM E007 training.
 
-Stage 1 trains only latent dynamics with latent MSE + SIGReg.
-Stage 2 freezes the latent world model and trains only the physical prober.
+Stage 1 trains only the latent block world model with latent MSE + SIGReg.
+Stage 2 freezes that world model and trains only the physical prober.
 """
 from __future__ import annotations
 
@@ -20,13 +20,13 @@ from control.MiniController.tracking import SwanLabTracker
 from .dataloader import (
     PHYSICAL_COLS,
     action_bounds,
+    block_sequence_arrays,
     columns_from_config,
     describe_runs,
     fit_normalizer,
     load_all_runs,
-    sequence_arrays,
 )
-from .model import HanWAM, build_wam_model
+from .model import HanWAMControllerModel, HanWAMWorldModel, build_controller_model_from_world_model, build_world_model
 from .utils import choose_device
 
 
@@ -80,6 +80,14 @@ def _stage_cfg(config: dict, stage: str) -> dict:
     return merged
 
 
+def _block_params(config: dict) -> tuple[int, int, int]:
+    train_cfg = config.get("train") or {}
+    frames_per_block = int(train_cfg.get("frames_per_block", 12))
+    history_blocks = int(train_cfg.get("history_blocks", 3))
+    future_blocks = int(train_cfg.get("future_blocks", 5))
+    return frames_per_block, history_blocks, future_blocks
+
+
 def _stage1_checkpoint_path(config: dict, mode: int) -> Path:
     final = checkpoint_path(config, mode)
     return final.with_name(f"{final.stem}_stage1{final.suffix}")
@@ -99,19 +107,38 @@ def _checkpoint_epochs(stage_cfg: dict, total_epochs: int) -> set[int]:
 
 
 def _planner_config(config: dict, mode: int) -> dict:
+    frames_per_block, history_blocks, future_blocks = _block_params(config)
     planner = dict((config.get("method") or {}).get("planner") or {})
-    planner.setdefault("objective", "hanwam_simple")
-    planner.setdefault("horizon_steps", 24)
-    planner.setdefault("chunk_steps", 6)
-    planner.setdefault("num_samples", 128)
+    planner.setdefault("algorithm", "mppi")
+    planner.setdefault("objective", "hanwam_e007")
+    planner.setdefault("horizon_steps", frames_per_block * future_blocks)
+    planner.setdefault("frames_per_block", frames_per_block)
+    planner.setdefault("future_blocks", future_blocks)
+    planner.setdefault("chunk_steps", frames_per_block)
+    planner.setdefault("control_interval_steps", 6)
+    planner.setdefault("num_samples", 512)
     planner.setdefault("num_iterations", 3)
-    planner.setdefault("elite_ratio", 0.1)
+    planner.setdefault("temperature", 1.0)
     planner.setdefault("step_seconds", int(config["data"]["sampling"]["step_seconds"]))
     planner.setdefault("reference_schedule", "deadline_linear")
+    planner.setdefault("comfort_band_reference", "schedule_then_target")
+    planner.setdefault("comfort_band_c", 0.5)
+    planner.setdefault("target_band_margin_seconds", 600.0)
+    planner.setdefault("deadline_comfort_band_c", 0.5)
+    planner.setdefault("target_margin_comfort_band_c", 0.5)
     planner.setdefault("compressor_on_threshold_hz", 15.0)
     planner.setdefault("snap_deadband_freq", True)
-    planner.setdefault("cost_weights", {"tracking": 4.0, "energy": 2.0, "action_smooth": 0.05})
-    planner.setdefault("history_steps", int((config.get("train") or {}).get("history_steps", 1)))
+    planner.setdefault(
+        "cost_weights",
+        {
+            "comfort_band_violation": 4.0,
+            "target_margin_band_violation": 12.0,
+            "deadline_band_violation": 40.0,
+            "energy": 2.0,
+            "action_smooth": 0.20,
+        },
+    )
+    planner.setdefault("history_blocks", history_blocks)
     planner["mode"] = int(mode)
     return planner
 
@@ -129,50 +156,59 @@ def _tracker(config: dict, mode: int, stage: str) -> SwanLabTracker:
 
 def _prepare_data(config: dict, mode: int):
     train_cfg = config["train"]
-    horizon_steps = int(train_cfg.get("horizon_steps", 60))
     seed = int(config["experiment"]["seed"])
+    frames_per_block, history_blocks, future_blocks = _block_params(config)
     runs = load_all_runs(mode=mode, config=config)
     limit = int(train_cfg.get("limit_transitions", 0))
     val_limit = int(train_cfg.get("val_limit_transitions", min(limit, 8192) if limit > 0 else 0))
-    train_obs, train_actions, train_future, train_physical, _ = sequence_arrays(
-        runs, "train", horizon_steps=horizon_steps, config=config, limit=limit, seed=seed
-    )
-    val_obs, val_actions, val_future, val_physical, _ = sequence_arrays(
-        runs, "val", horizon_steps=horizon_steps, config=config, limit=val_limit, seed=seed + 1
-    )
+    train_arrays = block_sequence_arrays(runs, "train", config=config, limit=limit, seed=seed)
+    val_arrays = block_sequence_arrays(runs, "val", config=config, limit=val_limit, seed=seed + 1)
+    train_obs_history, train_act_history, train_future_act, train_target_obs, train_physical, _ = train_arrays
     obs_norm = fit_normalizer(
         np.concatenate(
             [
-                train_obs.reshape(-1, train_obs.shape[-1]),
-                train_future.reshape(-1, train_future.shape[-1]),
+                train_obs_history.reshape(-1, train_obs_history.shape[-1]),
+                train_target_obs.reshape(-1, train_target_obs.shape[-1]),
             ],
             axis=0,
         )
     )
     action_norm = fit_normalizer(
-        train_actions.reshape(-1, train_actions.shape[-1])
+        np.concatenate(
+            [
+                train_act_history.reshape(-1, train_act_history.shape[-1]),
+                train_future_act.reshape(-1, train_future_act.shape[-1]),
+            ],
+            axis=0,
+        )
     )
     physical_norm = fit_normalizer(train_physical.reshape(-1, train_physical.shape[-1]))
     return {
         "runs": runs,
-        "train": (train_obs, train_actions, train_future, train_physical),
-        "val": (val_obs, val_actions, val_future, val_physical),
+        "train": train_arrays[:5],
+        "val": val_arrays[:5],
+        "train_keys": train_arrays[5],
+        "val_keys": val_arrays[5],
         "obs_norm": obs_norm,
         "action_norm": action_norm,
         "physical_norm": physical_norm,
-        "horizon_steps": horizon_steps,
-        "history_steps": int(train_cfg.get("history_steps", 1)),
+        "frames_per_block": frames_per_block,
+        "history_blocks": history_blocks,
+        "future_blocks": future_blocks,
+        "history_steps": frames_per_block * history_blocks,
+        "horizon_steps": frames_per_block * future_blocks,
     }
 
 
 def _loader(arrays, obs_norm, action_norm, physical_norm, batch_size: int) -> DataLoader:
-    obs, actions, future, physical = arrays
+    obs_history, act_history, future_act, target_obs, physical = arrays
     return DataLoader(
         TensorDataset(
-            torch.as_tensor(obs_norm.encode(obs), dtype=torch.float32),
-            torch.as_tensor(action_norm.encode(actions.reshape(-1, actions.shape[-1])).reshape(actions.shape), dtype=torch.float32),
-            torch.as_tensor(obs_norm.encode(future.reshape(-1, future.shape[-1])).reshape(future.shape), dtype=torch.float32),
-            torch.as_tensor(physical_norm.encode(physical.reshape(-1, physical.shape[-1])).reshape(physical.shape), dtype=torch.float32),
+            torch.as_tensor(obs_norm.encode(obs_history), dtype=torch.float32),
+            torch.as_tensor(action_norm.encode(act_history), dtype=torch.float32),
+            torch.as_tensor(action_norm.encode(future_act), dtype=torch.float32),
+            torch.as_tensor(obs_norm.encode(target_obs), dtype=torch.float32),
+            torch.as_tensor(physical_norm.encode(physical), dtype=torch.float32),
         ),
         batch_size=batch_size,
         shuffle=True,
@@ -181,17 +217,19 @@ def _loader(arrays, obs_norm, action_norm, physical_norm, batch_size: int) -> Da
 
 
 @torch.no_grad()
-def _eval_stage1(model, loader: DataLoader, device: torch.device, loss_cfg: dict) -> dict:
+def _eval_stage1(model: HanWAMWorldModel, loader: DataLoader, device: torch.device, loss_cfg: dict) -> dict:
     model.eval()
     rows = []
-    for obs_b, actions_b, future_b, _ in loader:
+    for obs_b, act_hist_b, future_act_b, target_obs_b, _ in loader:
         obs_b = obs_b.to(device)
-        actions_b = actions_b.to(device)
-        future_b = future_b.to(device)
+        act_hist_b = act_hist_b.to(device)
+        future_act_b = future_act_b.to(device)
+        target_obs_b = target_obs_b.to(device)
         breakdown = model.latent_sequence_loss(
             obs_b,
-            actions_b,
-            future_b,
+            act_hist_b,
+            future_act_b,
+            target_obs_b,
             **loss_cfg,
         )
         rows.append([float(breakdown.total.cpu()), float(breakdown.latent.cpu()), float(breakdown.regularizer.cpu())])
@@ -203,19 +241,27 @@ def _eval_stage1(model, loader: DataLoader, device: torch.device, loss_cfg: dict
 
 
 @torch.no_grad()
-def _eval_stage2(model, loader: DataLoader, physical_norm, device: torch.device, physical_weights: torch.Tensor | None) -> dict:
+def _eval_stage2(
+    model: HanWAMControllerModel,
+    loader: DataLoader,
+    physical_norm,
+    device: torch.device,
+    physical_weights: torch.Tensor | None,
+) -> dict:
     model.eval()
     pred_chunks = []
     target_chunks = []
     losses = []
     horizon = None
-    for obs_b, actions_b, _, physical_b in loader:
+    for obs_b, act_hist_b, future_act_b, _, physical_b in loader:
         obs_b = obs_b.to(device)
-        actions_b = actions_b.to(device)
+        act_hist_b = act_hist_b.to(device)
+        future_act_b = future_act_b.to(device)
         physical_b = physical_b.to(device)
         loss, pred_n = model.prober_sequence_loss(
             obs_b,
-            actions_b,
+            act_hist_b,
+            future_act_b,
             physical_b,
             physical_weights=physical_weights,
         )
@@ -223,27 +269,26 @@ def _eval_stage2(model, loader: DataLoader, physical_norm, device: torch.device,
         pred_chunks.append(pred_n.cpu().numpy())
         target_chunks.append(physical_b.cpu().numpy())
         horizon = physical_b.shape[1]
+    if horizon is None:
+        raise ValueError("empty loader")
     pred = physical_norm.decode(np.concatenate(pred_chunks).reshape(-1, len(PHYSICAL_COLS)))
     target = physical_norm.decode(np.concatenate(target_chunks).reshape(-1, len(PHYSICAL_COLS)))
     err = pred - target
     idx = {name: i for i, name in enumerate(PHYSICAL_COLS)}
-    if horizon is None:
-        raise ValueError("empty loader")
     pred_delta = pred[:, idx["T_in_delta"]].reshape(-1, horizon)
     target_delta = target[:, idx["T_in_delta"]].reshape(-1, horizon)
     cum_err = np.cumsum(pred_delta, axis=1) - np.cumsum(target_delta, axis=1)
     return {
         "val_stage2_loss": float(np.mean(losses)),
         "physical_rmse": float(np.sqrt(np.mean(err * err))),
-        "T_in_mae_c": float(np.mean(np.abs(err[:, idx["T_in"]]))),
-        "freq_mae_hz": float(np.mean(np.abs(err[:, idx["freq"]]))),
+        "T_in_delta_mae_c": float(np.mean(np.abs(err[:, idx["T_in_delta"]]))),
         "electric_delta_mae_kwh": float(np.mean(np.abs(err[:, idx["electric_kwh_delta"]]))),
         "T_delta_cum_mae_c": float(np.mean(np.abs(cum_err))),
         "T_delta_cum_final_mae_c": float(np.mean(np.abs(cum_err[:, -1]))),
     }
 
 
-def _physical_weights(config: dict, physical_norm, device: torch.device) -> torch.Tensor | None:
+def _physical_weights(config: dict, device: torch.device) -> torch.Tensor | None:
     weights_cfg = ((config["train"].get("stage2") or {}).get("loss") or {}).get("physical_weights")
     if not weights_cfg:
         return None
@@ -251,17 +296,161 @@ def _physical_weights(config: dict, physical_norm, device: torch.device) -> torc
     return torch.as_tensor(values, dtype=torch.float32, device=device)
 
 
-def _base_payload(config: dict, mode: int, model, data: dict, result_dir: Path) -> dict:
+def _stage2_cumulative_weights(config: dict) -> dict[str, float]:
+    loss_cfg = ((config["train"].get("stage2") or {}).get("loss") or {})
+    return {
+        "T_in_delta": float(loss_cfg.get("cumulative_T_in_delta_weight", 0.0)),
+        "electric_kwh_delta": float(loss_cfg.get("cumulative_electric_kwh_delta_weight", 0.0)),
+    }
+
+
+def _stage2_loss(
+    model: HanWAMControllerModel,
+    obs_b: torch.Tensor,
+    act_hist_b: torch.Tensor,
+    future_act_b: torch.Tensor,
+    physical_b: torch.Tensor,
+    physical_weights: torch.Tensor | None,
+    physical_std: torch.Tensor,
+    cumulative_weights: dict[str, float],
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    base_loss, pred_n = model.prober_sequence_loss(
+        obs_b,
+        act_hist_b,
+        future_act_b,
+        physical_b,
+        physical_weights=physical_weights,
+    )
+    err_phys = (pred_n - physical_b) * physical_std.view(1, 1, -1)
+    extra = pred_n.new_tensor(0.0)
+    parts = {"base_loss": float(base_loss.detach().cpu())}
+    idx = {name: i for i, name in enumerate(PHYSICAL_COLS)}
+    weight = float(cumulative_weights.get("T_in_delta", 0.0))
+    if weight > 0.0 and "T_in_delta" in idx:
+        cum_t = torch.cumsum(err_phys[:, :, idx["T_in_delta"]], dim=1).pow(2).mean()
+        extra = extra + weight * cum_t
+        parts["cum_T_in_delta_loss"] = float(cum_t.detach().cpu())
+    weight = float(cumulative_weights.get("electric_kwh_delta", 0.0))
+    if weight > 0.0 and "electric_kwh_delta" in idx:
+        cum_e = torch.cumsum(err_phys[:, :, idx["electric_kwh_delta"]], dim=1).pow(2).mean()
+        extra = extra + weight * cum_e
+        parts["cum_electric_kwh_delta_loss"] = float(cum_e.detach().cpu())
+    total = base_loss + extra
+    parts["total_loss"] = float(total.detach().cpu())
+    return total, pred_n, parts
+
+
+def _world_model_config(config: dict) -> dict:
+    model_cfg = dict(((config.get("method") or {}).get("model") or {}))
+    columns = columns_from_config(config)
+    frames_per_block, history_blocks, future_blocks = _block_params(config)
+    latent_dim = int(model_cfg.get("latent_dim", 64))
+    return {
+        "class_name": "HanWAMWorldModel",
+        "obs_dim": len(columns["observation"]),
+        "action_dim": len(columns["target_action"]),
+        "latent_dim": latent_dim,
+        "hidden_dim": int(model_cfg.get("hidden_dim", 128)),
+        "action_latent_dim": int(model_cfg.get("action_latent_dim", max(16, latent_dim // 2))),
+        "tcn_layers": int(model_cfg.get("tcn_layers", 2)),
+        "frames_per_block": frames_per_block,
+        "history_blocks": history_blocks,
+        "future_blocks": future_blocks,
+    }
+
+
+def _controller_model_config(config: dict, data: dict | None = None) -> dict:
+    model_cfg = dict(((config.get("method") or {}).get("model") or {}))
+    class_name = str(model_cfg.get("class_name", "HanWAMControllerModel"))
+    payload = {
+        "class_name": class_name,
+        "physical_dim": len(PHYSICAL_COLS),
+        "prober_hidden_dim": int(model_cfg.get("prober_hidden_dim", model_cfg.get("hidden_dim", 128))),
+        "prober_action_scale": float(model_cfg.get("prober_action_scale", 1.0)),
+        "world_model_config": _world_model_config(config),
+    }
+    if class_name in {"HanWAMPhysicsGuidedControllerModel", "HanWAMHardMechanismControllerModel"}:
+        common_physics_keys = {
+            "freq_on_threshold_hz",
+            "freq_max_hz",
+            "fan_max",
+            "eev_min",
+            "eev_max",
+            "eev_width_min",
+            "eev_width_max",
+            "eev_effect_floor",
+            "compressor_energy_scale",
+            "fan_energy_scale",
+            "energy_model",
+            "energy_step_seconds",
+            "energy_power_intercept_w",
+            "energy_power_linear_w_per_hz",
+            "energy_power_quadratic_w_per_hz2",
+            "compressor_transition_hz",
+            "fan_effect_floor",
+            "freq_effect_floor",
+            "mechanism_context_blend",
+            "temperature_mechanism",
+            "baseline_drift_scale_c",
+            "cooling_history_seconds",
+            "cooling_freq_exponent",
+            "cooling_fan_exponent",
+            "cooling_fan_reference",
+            "cooling_eev_reference",
+            "cooling_eev_range",
+            "cooling_eev_gain_scale",
+            "cooling_eev_effect_min",
+            "cooling_eev_effect_max",
+            "cooling_lag_enabled",
+            "cooling_lag_alpha_min",
+            "cooling_lag_alpha_max",
+            "energy_eev_correction_mode",
+            "energy_eev_correction_scale_w",
+            "energy_eev_correction_min_w",
+            "energy_eev_correction_max_w",
+            "energy_eev_anchor",
+            "energy_eev_range",
+        }
+        soft_physics_keys = {
+            "passive_delta_scale",
+            "cooling_delta_scale",
+            "residual_delta_scale",
+            "residual_energy_scale",
+            "passive_nonnegative",
+        }
+        hard_physics_keys = {
+            "ua_delta_scale",
+            "internal_delta_scale",
+            "cooling_delta_scale",
+            "cop_min",
+            "cop_max",
+            "t_in_obs_index",
+            "t_out_obs_index",
+        }
+        physics_keys = set(common_physics_keys)
+        if class_name == "HanWAMPhysicsGuidedControllerModel":
+            physics_keys.update(soft_physics_keys)
+        if class_name == "HanWAMHardMechanismControllerModel":
+            physics_keys.update(hard_physics_keys)
+        for key in physics_keys:
+            if key in model_cfg:
+                payload[key] = model_cfg[key]
+        if data is not None:
+            payload["action_mean"] = data["action_norm"].mean.tolist()
+            payload["action_std"] = data["action_norm"].std.tolist()
+            payload["physical_mean"] = data["physical_norm"].mean.tolist()
+            payload["physical_std"] = data["physical_norm"].std.tolist()
+            payload["obs_mean"] = data["obs_norm"].mean.tolist()
+            payload["obs_std"] = data["obs_norm"].std.tolist()
+            columns = columns_from_config(config)["observation"]
+            payload["t_in_obs_index"] = int(columns.index("T_in"))
+            payload["t_out_obs_index"] = int(columns.index("T_out"))
+    return payload
+
+
+def _base_payload(config: dict, mode: int, data: dict, result_dir: Path) -> dict:
     runs = data["runs"]
     return {
-        "model_config": {
-            "class_name": "HanWAM",
-            **{
-                key: value
-                for key, value in model.__dict__.items()
-                if key in set()
-            },
-        },
         "obs_cols": columns_from_config(config)["observation"],
         "target_action_cols": columns_from_config(config)["target_action"],
         "physical_cols": PHYSICAL_COLS,
@@ -271,30 +460,17 @@ def _base_payload(config: dict, mode: int, model, data: dict, result_dir: Path) 
         "physical_norm": data["physical_norm"].to_dict(),
         "target_action_bounds": action_bounds(runs, config=config),
         "planner_config": _planner_config(config, mode),
-        "history_steps": int(data.get("history_steps", (config.get("train") or {}).get("history_steps", 1))),
+        "frames_per_block": int(data["frames_per_block"]),
+        "history_blocks": int(data["history_blocks"]),
+        "future_blocks": int(data["future_blocks"]),
+        "history_steps": int(data["history_steps"]),
+        "horizon_steps": int(data["horizon_steps"]),
         "resolved_config": config,
         "result_dir": str(result_dir),
     }
 
 
-def _model_config(config: dict) -> dict:
-    method_cfg = config["method"]
-    model_cfg = dict(method_cfg.get("model") or {})
-    model_cfg.setdefault("class_name", "HanWAM")
-    columns = columns_from_config(config)
-    return {
-        "class_name": model_cfg.get("class_name", "HanWAM"),
-        "obs_dim": len(columns["observation"]),
-        "action_dim": len(columns["target_action"]),
-        "physical_dim": len(PHYSICAL_COLS),
-        "latent_dim": int(model_cfg.get("latent_dim", 64)),
-        "hidden_dim": int(model_cfg.get("hidden_dim", 128)),
-        "action_latent_dim": int(model_cfg.get("action_latent_dim", max(16, int(model_cfg.get("latent_dim", 64)) // 2))),
-        "tcn_layers": int(model_cfg.get("tcn_layers", 2)),
-    }
-
-
-def _save_checkpoint(path: Path, payload: dict, model) -> None:
+def _save_checkpoint(path: Path, payload: dict, model: torch.nn.Module) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(payload)
     try:
@@ -307,7 +483,13 @@ def _save_checkpoint(path: Path, payload: dict, model) -> None:
         model.to(original_device)
 
 
-def train_stage1(config: dict, mode: int, data: dict, device: torch.device, result_dir: Path) -> tuple[HanWAM, Path, list[dict]]:
+def train_stage1(
+    config: dict,
+    mode: int,
+    data: dict,
+    device: torch.device,
+    result_dir: Path,
+) -> tuple[HanWAMWorldModel, Path, list[dict]]:
     stage_cfg = _stage_cfg(config, "stage1")
     loss_cfg = dict(stage_cfg.get("loss") or {})
     loss_cfg = {
@@ -318,12 +500,9 @@ def train_stage1(config: dict, mode: int, data: dict, device: torch.device, resu
         "sigreg_num_projections": int(loss_cfg.get("sigreg_num_projections", 64)),
         "sigreg_mean_weight": float(loss_cfg.get("sigreg_mean_weight", 1.0)),
     }
-    model = build_wam_model(_model_config(config)).to(device)
-    if not isinstance(model, HanWAM):
-        raise TypeError("HanWAM train requires method.model.class_name=HanWAM")
-    model.freeze_prober()
+    model = build_world_model(_world_model_config(config)).to(device)
     optimizer = torch.optim.AdamW(
-        [param for param in model.world_model_parameters() if param.requires_grad],
+        model.parameters(),
         lr=float(stage_cfg["lr"]),
         weight_decay=float(stage_cfg["weight_decay"]),
     )
@@ -333,17 +512,19 @@ def train_stage1(config: dict, mode: int, data: dict, device: torch.device, resu
     history = []
     total_epochs = int(stage_cfg["epochs"])
     checkpoint_epochs = _checkpoint_epochs(stage_cfg, total_epochs)
-    for epoch in range(1, int(stage_cfg["epochs"]) + 1):
+    for epoch in range(1, total_epochs + 1):
         model.train()
         rows = []
-        for obs_b, actions_b, future_b, _ in train_loader:
+        for obs_b, act_hist_b, future_act_b, target_obs_b, _ in train_loader:
             obs_b = obs_b.to(device)
-            actions_b = actions_b.to(device)
-            future_b = future_b.to(device)
+            act_hist_b = act_hist_b.to(device)
+            future_act_b = future_act_b.to(device)
+            target_obs_b = target_obs_b.to(device)
             breakdown = model.latent_sequence_loss(
                 obs_b,
-                actions_b,
-                future_b,
+                act_hist_b,
+                future_act_b,
+                target_obs_b,
                 **loss_cfg,
             )
             optimizer.zero_grad(set_to_none=True)
@@ -358,17 +539,17 @@ def train_stage1(config: dict, mode: int, data: dict, device: torch.device, resu
             "latent_loss": float(np.mean([r[1] for r in rows])),
             "sigreg_loss": float(np.mean([r[2] for r in rows])),
         }
-        if epoch == int(stage_cfg["epochs"]) or epoch % max(1, int(stage_cfg["epochs"]) // 5) == 0:
+        if epoch == total_epochs or epoch % max(1, total_epochs // 5) == 0:
             row.update(_eval_stage1(model, val_loader, device, loss_cfg))
         history.append(row)
         tracker.log({f"stage1/{k}": v for k, v in row.items() if isinstance(v, (int, float))}, step=epoch)
         print(json.dumps(row, ensure_ascii=False), flush=True)
         if epoch in checkpoint_epochs:
-            payload = _base_payload(config, mode, model, data, result_dir)
+            payload = _base_payload(config, mode, data, result_dir)
             payload.update(
                 {
-                    "model_config": _model_config(config),
-                    "training_phase": "stage1",
+                    "model_config": _world_model_config(config),
+                    "training_phase": "stage1_world_model",
                     "stage1_config": stage_cfg,
                     "history": history,
                     "epoch": epoch,
@@ -377,11 +558,11 @@ def train_stage1(config: dict, mode: int, data: dict, device: torch.device, resu
             _save_checkpoint(_epoch_checkpoint_path(config, mode, "stage1", epoch), payload, model)
     tracker.finish()
     pd.DataFrame(history).to_csv(result_dir / "hanwam_stage1_history.csv", index=False, encoding="utf-8-sig")
-    payload = _base_payload(config, mode, model, data, result_dir)
+    payload = _base_payload(config, mode, data, result_dir)
     payload.update(
         {
-            "model_config": _model_config(config),
-            "training_phase": "stage1",
+            "model_config": _world_model_config(config),
+            "training_phase": "stage1_world_model",
             "stage1_config": stage_cfg,
             "history": history,
         }
@@ -392,16 +573,27 @@ def train_stage1(config: dict, mode: int, data: dict, device: torch.device, resu
     return model, stage1_path, history
 
 
-def train_stage2(config: dict, mode: int, data: dict, device: torch.device, result_dir: Path, model: HanWAM | None = None) -> tuple[HanWAM, Path, list[dict]]:
+def _load_stage1_world_model(path: Path) -> HanWAMWorldModel:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    model = build_world_model(checkpoint["model_config"])
+    model.load_state_dict(checkpoint["model"])
+    return model
+
+
+def train_stage2(
+    config: dict,
+    mode: int,
+    data: dict,
+    device: torch.device,
+    result_dir: Path,
+    world_model: HanWAMWorldModel | None = None,
+) -> tuple[HanWAMControllerModel, Path, list[dict]]:
     stage_cfg = _stage_cfg(config, "stage2")
     stage1_path = Path((config["train"].get("stage2") or {}).get("stage1_checkpoint") or _stage1_checkpoint_path(config, mode))
-    if model is None:
-        checkpoint = torch.load(stage1_path, map_location="cpu", weights_only=False)
-        model = build_wam_model(checkpoint["model_config"])
-        model.load_state_dict(checkpoint["model"])
-    if not isinstance(model, HanWAM):
-        raise TypeError("HanWAM stage2 requires a HanWAM checkpoint")
-    model = model.to(device)
+    if world_model is None:
+        world_model = _load_stage1_world_model(stage1_path)
+    model_cfg = _controller_model_config(config, data)
+    model = build_controller_model_from_world_model(world_model, model_cfg).to(device)
     model.freeze_world_model()
     optimizer = torch.optim.AdamW(
         [param for param in model.prober_parameters() if param.requires_grad],
@@ -410,45 +602,57 @@ def train_stage2(config: dict, mode: int, data: dict, device: torch.device, resu
     )
     train_loader = _loader(data["train"], data["obs_norm"], data["action_norm"], data["physical_norm"], int(stage_cfg["batch_size"]))
     val_loader = _loader(data["val"], data["obs_norm"], data["action_norm"], data["physical_norm"], int(stage_cfg["batch_size"]))
-    physical_weights = _physical_weights(config, data["physical_norm"], device)
+    physical_weights = _physical_weights(config, device)
+    cumulative_weights = _stage2_cumulative_weights(config)
+    physical_std = torch.as_tensor(data["physical_norm"].std, dtype=torch.float32, device=device)
     tracker = _tracker(config, mode, "stage2")
     history = []
     total_epochs = int(stage_cfg["epochs"])
     checkpoint_epochs = _checkpoint_epochs(stage_cfg, total_epochs)
-    for epoch in range(1, int(stage_cfg["epochs"]) + 1):
+    for epoch in range(1, total_epochs + 1):
         model.train()
         rows = []
-        for obs_b, actions_b, _, physical_b in train_loader:
+        part_rows: dict[str, list[float]] = {}
+        for obs_b, act_hist_b, future_act_b, _, physical_b in train_loader:
             obs_b = obs_b.to(device)
-            actions_b = actions_b.to(device)
+            act_hist_b = act_hist_b.to(device)
+            future_act_b = future_act_b.to(device)
             physical_b = physical_b.to(device)
-            loss, _ = model.prober_sequence_loss(
+            loss, _, parts = _stage2_loss(
+                model,
                 obs_b,
-                actions_b,
+                act_hist_b,
+                future_act_b,
                 physical_b,
-                physical_weights=physical_weights,
+                physical_weights,
+                physical_std,
+                cumulative_weights,
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.prober.parameters(), 5.0)
             optimizer.step()
             rows.append(float(loss.detach().cpu()))
+            for key, value in parts.items():
+                part_rows.setdefault(key, []).append(float(value))
         row = {
             "stage": "stage2",
             "epoch": epoch,
             "loss": float(np.mean(rows)),
         }
-        if epoch == int(stage_cfg["epochs"]) or epoch % max(1, int(stage_cfg["epochs"]) // 5) == 0:
+        for key, values in part_rows.items():
+            row[key] = float(np.mean(values))
+        if epoch == total_epochs or epoch % max(1, total_epochs // 5) == 0:
             row.update(_eval_stage2(model, val_loader, data["physical_norm"], device, physical_weights))
         history.append(row)
         tracker.log({f"stage2/{k}": v for k, v in row.items() if isinstance(v, (int, float))}, step=epoch)
         print(json.dumps(row, ensure_ascii=False), flush=True)
         if epoch in checkpoint_epochs:
-            payload = _base_payload(config, mode, model, data, result_dir)
+            payload = _base_payload(config, mode, data, result_dir)
             payload.update(
                 {
-                    "model_config": _model_config(config),
-                    "training_phase": "stage2",
+                    "model_config": model_cfg,
+                    "training_phase": "stage2_controller",
                     "stage1_checkpoint": str(stage1_path),
                     "stage2_config": stage_cfg,
                     "history": history,
@@ -458,11 +662,11 @@ def train_stage2(config: dict, mode: int, data: dict, device: torch.device, resu
             _save_checkpoint(_epoch_checkpoint_path(config, mode, "stage2", epoch), payload, model)
     tracker.finish()
     pd.DataFrame(history).to_csv(result_dir / "hanwam_stage2_history.csv", index=False, encoding="utf-8-sig")
-    payload = _base_payload(config, mode, model, data, result_dir)
+    payload = _base_payload(config, mode, data, result_dir)
     payload.update(
         {
-            "model_config": _model_config(config),
-            "training_phase": "stage2",
+            "model_config": model_cfg,
+            "training_phase": "stage2_controller",
             "stage1_checkpoint": str(stage1_path),
             "stage2_config": stage_cfg,
             "history": history,
@@ -485,13 +689,13 @@ def train_one_mode(config: dict, mode: int) -> dict:
     describe_runs(data["runs"]).to_csv(result_dir / "hanwam_data_audit.csv", index=False, encoding="utf-8-sig")
     stage = str(config["train"].get("stage", "both"))
     result: dict = {}
-    model = None
+    world_model = None
     if stage in {"stage1", "both"}:
-        model, stage1_path, stage1_history = train_stage1(config, mode, data, device, result_dir)
+        world_model, stage1_path, stage1_history = train_stage1(config, mode, data, device, result_dir)
         result["stage1_checkpoint"] = str(stage1_path)
         result["stage1_history"] = stage1_history
     if stage in {"stage2", "both"}:
-        model, final_path, stage2_history = train_stage2(config, mode, data, device, result_dir, model=model)
+        model, final_path, stage2_history = train_stage2(config, mode, data, device, result_dir, world_model=world_model)
         result["checkpoint"] = str(final_path)
         result["stage2_history"] = stage2_history
     return result

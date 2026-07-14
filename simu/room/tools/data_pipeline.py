@@ -18,8 +18,15 @@ def load_status_csv(path: str | Path, repair_coarse_timestamps: bool = True) -> 
     for column in RAW_COLUMNS[1:]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.dropna(subset=["ts", "T_in", *CONTROL_COLUMNS]).reset_index(drop=True)
+
+    # Some eval files (e.g. model-takeover B/C) log timestamps at minute
+    # precision only, while the underlying samples are still 5 s apart.
+    # Detect this and reconstruct 5 s timestamps from the first sample.
     unique_ratio = frame["ts"].nunique() / max(1, len(frame))
-    reconstructed = bool(repair_coarse_timestamps and unique_ratio < 0.5)
+    minute_level = bool((frame["ts"].dt.second == 0).all())
+    reconstructed = bool(
+        repair_coarse_timestamps and unique_ratio < 0.5 and minute_level
+    )
     if reconstructed:
         frame["ts"] = frame["ts"].iloc[0] + pd.to_timedelta(
             np.arange(len(frame), dtype=float) * DT_SECONDS, unit="s",

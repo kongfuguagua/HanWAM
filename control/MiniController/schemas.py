@@ -1,7 +1,7 @@
 """Shared schemas for controller and simulator interaction."""
 from __future__ import annotations
 
-TEMPERATURE_OBS_COLS = ["T_out", "T_out_coil", "T_in", "T_in_coil"]
+TEMPERATURE_OBS_COLS = ["T_out", "T_out_coil", "T_out_discharge", "T_in", "T_in_coil"]
 ACTUATOR_OBS_COLS = ["freq_target", "freq", "eev", "fan_out"]
 INDOOR_ENV_OBS_COLS = ["fan_in", "RH_in"]
 SETPOINT_OBS_COLS = ["T_set", "mode"]

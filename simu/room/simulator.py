@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Mapping, Sequence
 
 import joblib
@@ -11,13 +12,15 @@ import pandas as pd
 
 try:
     from .continuous_model import (
-        CONTROL_COLUMNS, DT_SECONDS, STATE_COLUMNS, ContinuousFeatureState,
-        HeatLoadServoConfig, StandardHeatLoadServo,
+        CONTROL_COLUMNS, DT_SECONDS, PLANT_STATE_COLUMNS, STATE_COLUMNS,
+        AutoregressiveFeatureState, ContinuousFeatureState,
+        FeatureConfig, HeatLoadServoConfig, StandardHeatLoadServo,
     )
 except ImportError:  # direct script execution
     from continuous_model import (  # type: ignore
-        CONTROL_COLUMNS, DT_SECONDS, STATE_COLUMNS, ContinuousFeatureState,
-        HeatLoadServoConfig, StandardHeatLoadServo,
+        CONTROL_COLUMNS, DT_SECONDS, PLANT_STATE_COLUMNS, STATE_COLUMNS,
+        AutoregressiveFeatureState, ContinuousFeatureState,
+        FeatureConfig, HeatLoadServoConfig, StandardHeatLoadServo,
     )
 
 
@@ -25,8 +28,23 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_MODEL_PATH = HERE / "continuous_cooling_model.joblib"
 
 
+def _install_sklearn_loss_compatibility() -> None:
+    if "_loss" in sys.modules:
+        return
+    try:
+        import sklearn._loss.loss as sklearn_loss
+    except ImportError:
+        return
+    sys.modules["_loss"] = sklearn_loss
+
+
 class ContinuousEnthalpyRoomEnv:
-    """与 ``simu.temperature.OnlineEnthalpyRoomEnv`` 类似的 5 秒在线环境。"""
+    """与 ``simu.temperature.OnlineEnthalpyRoomEnv`` 类似的 5 秒在线环境。
+
+    从 V3 开始，该环境是一个纯 plant 模型：只根据当前热状态
+    （室内外温度、盘管温度、湿度等）和三个控制量预测下一时刻室内温度。
+    目标温度 ``T_set`` 不再作为模型输入传入，仅用于上层控制器。
+    """
 
     # Hybrid off-cycle physics fallback parameters, calibrated from
     # data/dataset off-cycle segments. These are constants, not user-tunable.
@@ -35,17 +53,19 @@ class ContinuousEnthalpyRoomEnv:
     FREQ_ZERO_THRESHOLD = 0.5  # Hz
 
     def __init__(
-        
         self,
-       
         model_path: str | Path = DEFAULT_MODEL_PATH,
         use_physics_offcycle: bool | None = None,
         passive_heat_tau_seconds: float | None = None,
+        active_cooling_gain: float = 0.0,
+        active_cooling_band: float = 0.0,
     ):
+        _install_sklearn_loss_compatibility()
         payload = joblib.load(model_path)
         if int(payload.get("supported_mode", 1)) != 1:
             raise ValueError("V3 仅支持制冷 mode=1")
         self.model = payload["model"]
+        self.feature_variant = str(payload.get("feature_variant", "thermal_inertia"))
         self.state_columns = list(payload.get("state_columns", STATE_COLUMNS))
         self.state_medians = np.asarray(payload["state_medians"], np.float32)
         self.dt = float(payload.get("dt_seconds", DT_SECONDS))
@@ -58,6 +78,22 @@ class ContinuousEnthalpyRoomEnv:
             passive_tau if passive_heat_tau_seconds is None else passive_heat_tau_seconds
         )
         self.metadata = payload.get("metadata", {})
+        # Feature configuration for autoregressive variants. Missing config means
+        # an older model trained before physics-aware batches were added; default
+        # all batches to False to preserve exact feature dimensions.
+        feature_cfg = payload.get("feature_config")
+        if feature_cfg is None:
+            self.feature_config = FeatureConfig(
+                batch1_control_memory=False,
+                batch2_approach_temps=False,
+                batch3_interactions=False,
+            )
+        else:
+            self.feature_config = FeatureConfig(
+                batch1_control_memory=bool(feature_cfg.get("batch1_control_memory", True)),
+                batch2_approach_temps=bool(feature_cfg.get("batch2_approach_temps", True)),
+                batch3_interactions=bool(feature_cfg.get("batch3_interactions", True)),
+            )
         self.heat_load = StandardHeatLoadServo(
             HeatLoadServoConfig(**payload.get("heat_load_config", {}))
         )
@@ -72,6 +108,13 @@ class ContinuousEnthalpyRoomEnv:
         self.freq_zero_threshold = self.FREQ_ZERO_THRESHOLD
         self._outdoor_temperature: float = 0.0
         self.compressor_off_freq_hz = float(payload.get("compressor_off_freq_hz", 1.0))
+        self.autoregressive_horizon = int(payload.get("autoregressive_horizon", 1))
+
+        # These parameters are kept for API compatibility but are no longer used
+        # by the plant model; the trained model itself now encodes the cooling
+        # response without explicit setpoint knowledge.
+        self.active_cooling_gain = float(active_cooling_gain)
+        self.active_cooling_band = float(active_cooling_band)
         self._ready = False
 
     def reset(
@@ -87,7 +130,8 @@ class ContinuousEnthalpyRoomEnv:
         """重置环境。
 
         可像 temperature 模块一样传四个温度，也可传完整观测 ``Series/dict``：
-        ``reset(initial_observation=df.iloc[0])``。
+        ``reset(initial_observation=df.iloc[0])``。``T_set`` 可出现在观测中，
+        但会被忽略——本环境是纯 plant 模型，不应知道控制目标。
         """
         if isinstance(T_out, (Mapping, pd.Series)) and initial_observation is None:
             initial_observation = T_out
@@ -115,9 +159,18 @@ class ContinuousEnthalpyRoomEnv:
             raise ValueError(f"V3 制冷模型要求 mode=1，当前 mode={mode}")
         self.temperature = float(self.initial_state[index["T_in"]])
         self.outdoor_temperature = float(self.initial_state[index["T_out"]])
-        self.reference_temperature = float(self.initial_state[index["T_set"]])
         self._outdoor_temperature = float(self.initial_state[index["T_out"]])
-        self.prefix = ContinuousFeatureState(self.initial_state)
+        # Legacy thermal_inertia models need T_set as a reference; plant models
+        # do not use it. Keep the attribute for backward compatibility.
+        if "T_set" in index:
+            self.reference_temperature = float(self.initial_state[index["T_set"]])
+        else:
+            self.reference_temperature = float(self.temperature)
+
+        if self.feature_variant.startswith("autoregressive"):
+            self.prefix = AutoregressiveFeatureState(self.initial_state, self.feature_config)
+        else:
+            self.prefix = ContinuousFeatureState(self.initial_state)
         self.heat_load.reset(
             self.temperature, float(self.initial_state[index["T_out"]]), mode,
         )
@@ -131,15 +184,46 @@ class ContinuousEnthalpyRoomEnv:
         control = np.asarray([freq, eev, fan_out], np.float32)
         if not np.isfinite(control).all():
             raise ValueError("控制量含 NaN/Inf")
+
+        if self.feature_variant.startswith("autoregressive"):
+            self._step_autoregressive(control)
+        else:
+            self._step_thermal_inertia(control)
+
+        self.heat_load.update(self.temperature, self.dt)
+        return self._observation()
+
+    def _step_autoregressive(self, control: np.ndarray) -> None:
+        """Stateful plant-model step: predict absolute next T_in."""
+        freq = float(control[0])
+        self.prefix.update_temperature(self.temperature)
+        self.prefix.update_control(control)
+
+        if self.use_physics_offcycle and freq <= self.freq_zero_threshold:
+            dT = (
+                self.offcycle_b * (self._outdoor_temperature - self.temperature)
+                + self.offcycle_c
+            ) * (self.dt / 60.0)
+            self.temperature = float(np.clip(self.temperature + dT, -30.0, 65.0))
+        else:
+            horizon = max(1, self.autoregressive_horizon)
+            target = float(self.model.predict(self.prefix.feature()[None])[0])
+            delta = (target - self.temperature) / horizon
+            if self.max_rate_c_per_min is not None:
+                max_step = self.max_rate_c_per_min * self.dt / 60.0
+                delta = float(np.clip(delta, -max_step, max_step))
+            self.temperature = float(np.clip(self.temperature + delta, -30.0, 65.0))
+
+        self.last_direct_target = self.temperature
+
+    def _step_thermal_inertia(self, control: np.ndarray) -> None:
+        """Original open-loop target-offset prediction (kept for old models)."""
         self.prefix.update(control)
         offset = float(self.model.predict(self.prefix.feature()[None])[0])
-        self.last_direct_target = self.reference_temperature + offset
+        self.last_direct_target = self._reference_temperature + offset
+        freq = float(control[0])
 
-        # Hybrid off-cycle fallback: when the compressor is off, the ML model's
-        # historical EWM can keep predicting cooling.  Replace the ML-based
-        # temperature advance with a simple heat-balance model learned from
-        # training-data off-cycle segments.
-        if self.use_physics_offcycle and float(freq) <= self.freq_zero_threshold:
+        if self.use_physics_offcycle and freq <= self.freq_zero_threshold:
             dT = (
                 self.offcycle_b * (self._outdoor_temperature - self.temperature)
                 + self.offcycle_c
@@ -148,10 +232,14 @@ class ContinuousEnthalpyRoomEnv:
             self.last_direct_target = self.temperature
         else:
             self.last_direct_target = self._apply_compressor_physics(control, self.last_direct_target)
-        self._advance_temperature(self.last_direct_target)
+            self._advance_temperature(self.last_direct_target)
 
-        self.heat_load.update(self.temperature, self.dt)
-        return self._observation()
+        # Compatibility no-op: active_cooling_gain is ignored for the plant model.
+
+    @property
+    def _reference_temperature(self) -> float:
+        """Return the old T_set reference for legacy thermal_inertia models."""
+        return getattr(self, "reference_temperature", 0.0)
 
     def _apply_compressor_physics(self, control: np.ndarray, direct_target: float) -> float:
         freq = float(control[0])

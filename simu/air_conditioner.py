@@ -53,7 +53,7 @@ class AirConditionerSimulator:
         self,
         mode: int | str = 1,
         step_seconds: float = 5.0,
-        freq_cap: float | None = 90.0,
+        freq_cap: float | None = 80.0,
         energy_model: EnergyModel | None = None,
         freq_params: dict | None = None,
     ):
@@ -98,14 +98,16 @@ class AirConditionerSimulator:
             "tau_down": 10.0,
             "tau_clamp": 1000.0,
             "I_max": 3.0,
+            "on_threshold_hz": ON_THRESHOLD,
             "t_dead_cold_sec": 5.0,
             "t_dead_steady_sec": 0.0,
             "freq_max": FREQ_MAX,
         }
         params.update(self.freq_params)
         dt = self.step_seconds
-        is_off_to_on = self.last_target < ON_THRESHOLD and target >= ON_THRESHOLD
-        is_on_to_off = self.last_target >= ON_THRESHOLD and target < ON_THRESHOLD
+        on_threshold = float(params["on_threshold_hz"])
+        is_off_to_on = self.last_target < on_threshold and target >= on_threshold
+        is_on_to_off = self.last_target >= on_threshold and target < on_threshold
         is_jump = abs(target - self.last_target) > 5.0
         if is_off_to_on:
             self.dead_cold_remaining = int(float(params["t_dead_cold_sec"]) / dt)
@@ -126,6 +128,7 @@ class AirConditionerSimulator:
                 I_comp=0.0,
                 I_max=float(params["I_max"]),
                 freq_cap=self.freq_cap,
+                on_threshold=on_threshold,
             )
             if state == "off":
                 freq = 0.0

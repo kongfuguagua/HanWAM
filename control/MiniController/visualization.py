@@ -25,7 +25,7 @@ def plot_run_debug(trajectory: pd.DataFrame, path: str | Path, title: str) -> Pa
         where=electric_cum.to_numpy(dtype=float) > 0,
     )
 
-    fig, axes = plt.subplots(5, 1, figsize=(11, 13), sharex=True)
+    fig, axes = plt.subplots(7, 1, figsize=(12, 17), sharex=True)
     axes[0].plot(minutes, frame["T_in"], label="T_in", lw=1.7)
     axes[0].plot(minutes, frame["target_T_in"], label="target", lw=1.2, ls="--")
     axes[0].set_ylabel("Temp (C)")
@@ -33,28 +33,39 @@ def plot_run_debug(trajectory: pd.DataFrame, path: str | Path, title: str) -> Pa
 
     axes[1].plot(minutes, frame["freq_target"], label="freq_target", lw=1.5)
     axes[1].plot(minutes, frame["freq"], label="actual_freq", lw=1.5)
-    axes[1].set_ylabel("Hz")
+    axes[1].axhline(15.0, color="gray", lw=0.9, ls=":", label="15Hz threshold")
+    axes[1].set_ylabel("Compressor (Hz)")
     axes[1].legend()
 
-    axes[2].plot(minutes, frame["power_w"], label="power_w", lw=1.5)
-    axes[2].plot(minutes, frame["thermal_power_w"], label="thermal_power_w", lw=1.5)
-    axes[2].set_ylabel("W")
+    axes[2].plot(minutes, frame["eev"], label="eev", lw=1.5)
+    axes[2].set_ylabel("EEV")
     axes[2].legend()
 
-    axes[3].plot(minutes, electric_cum, label="electric_kwh", lw=1.5)
-    axes[3].plot(minutes, thermal_cum, label="thermal_kwh", lw=1.5)
-    axes[3].set_ylabel("kWh")
+    axes[3].plot(minutes, frame["fan_out"], label="fan_out", lw=1.5)
+    if "fan_in" in frame:
+        axes[3].plot(minutes, frame["fan_in"], label="fan_in", lw=1.0, alpha=0.65)
+    axes[3].set_ylabel("Fan (rpm)")
     axes[3].legend()
 
-    axes[4].plot(minutes, efficiency, label="thermal/electric", lw=1.5)
-    axes[4].set_ylabel("Efficiency")
-    axes[4].set_xlabel("Minutes")
+    axes[4].plot(minutes, frame["power_w"], label="power_w", lw=1.5)
+    axes[4].plot(minutes, frame["thermal_power_w"], label="thermal_power_w", lw=1.5)
+    axes[4].set_ylabel("W")
     axes[4].legend()
+
+    axes[5].plot(minutes, electric_cum, label="electric_kwh", lw=1.5)
+    axes[5].plot(minutes, thermal_cum, label="thermal_kwh", lw=1.5)
+    axes[5].set_ylabel("kWh")
+    axes[5].legend()
+
+    axes[6].plot(minutes, efficiency, label="thermal/electric", lw=1.5)
+    axes[6].set_ylabel("Efficiency")
+    axes[6].set_xlabel("Minutes")
+    axes[6].legend()
 
     for ax in axes:
         ax.grid(alpha=0.25)
     fig.suptitle(title)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 1, 0.985))
     fig.savefig(path, dpi=160)
     plt.close(fig)
     return path

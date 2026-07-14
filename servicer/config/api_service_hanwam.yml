@@ -1,0 +1,21 @@
+service:
+  host: 0.0.0.0
+  port: 24243
+  num_threads: 4
+  device: cpu
+
+logging:
+  level: info
+  mode: both
+  path: outputs/servicer/hanwam_service.log
+  payloads: true
+  max_bytes: 52428800
+  backup_count: 5
+
+controller:
+  type: hanwam_wm_mpc
+  mode: 1
+  step_seconds: 5
+  algorithm_config: control/HanWAM/config/hanwam_e065_lowfreq10_positive_eev_energy_v1.yml
+  checkpoint: control/HanWAM/checkpoints/hanwam_e065_lowfreq10_positive_eev_energy_v1_mode1.pt
+  planner_overrides: {}

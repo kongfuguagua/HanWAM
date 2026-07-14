@@ -60,3 +60,8 @@ python -m simu.room.tools.evaluate_all --data-dir data/dataset_eval --output-dir
 
 热负荷跟踪状态用于诊断，当前不直接进入温度估计。连续性机理见
 `CONTINUITY_FIX.md`。
+
+## V4
+
+V4 已独立移动到 `simu/roomv4`，不再放在 V3 目录中。用法见
+`simu/roomv4/README.md`。

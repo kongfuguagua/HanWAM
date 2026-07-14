@@ -1,0 +1,503 @@
+openapi: 3.0.3
+info:
+  title: Control API Servicer
+  version: 1.0.0
+  description: |
+    Generic HTTP JSON control service. The first adapter is `hanwam_wm_mpc`,
+    which plans one 5-second air-conditioner control action from complete
+    observation and action history windows supplied by the caller. Runtime
+    MPPI warm-start state is isolated by `unit_id`.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development server
+tags:
+  - name: health
+    description: Process and model readiness checks.
+  - name: control
+    description: Weakly stateful control planning endpoints.
+paths:
+  /healthz:
+    get:
+      tags:
+        - health
+      summary: Health check
+      description: Indicates that the HTTP process is alive. This does not guarantee that the controller checkpoint has loaded.
+      operationId: healthz
+      responses:
+        "200":
+          description: The service process is responding.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+  /readyz:
+    get:
+      tags:
+        - health
+      summary: Readiness check
+      description: Indicates that the controller adapter, checkpoint, and service configuration have loaded.
+      operationId: readyz
+      responses:
+        "200":
+          description: The controller is ready to accept control requests.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+              example:
+                status: ready
+                controller_type: hanwam_wm_mpc
+                model_id: hanwam_e007_block_mppi_v7_anchors_band045_e16_eval:0123456789ab
+        "503":
+          $ref: "#/components/responses/ServiceNotReady"
+  /v1/metadata:
+    get:
+      tags:
+        - control
+      summary: Get service metadata
+      description: Returns service configuration, logging configuration, controller schema, checkpoint identity, and action bounds.
+      operationId: getMetadata
+      responses:
+        "200":
+          description: Metadata for the running service instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataResponse"
+        "500":
+          $ref: "#/components/responses/ConfigError"
+  /v1/plan:
+    post:
+      tags:
+        - control
+      summary: Plan one control action
+      description: |
+        Plans one action using the control session keyed by `unit_id`. The
+        caller must still provide the complete history window ordered from
+        oldest to newest. For the current `hanwam_wm_mpc` adapter,
+        `obs_history` and `act_history` must each contain exactly 36 frames
+        sampled at `step_seconds=5`. HanWAM computes the effective DDL from
+        the first frame of the first valid request for each `unit_id` and
+        `target_temperature_c`.
+      operationId: plan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlanRequest"
+            example:
+              request_id: req-001
+              unit_id: ac-001
+              controller_type: hanwam_wm_mpc
+              mode: 1
+              step_seconds: 5
+              target_temperature_c: 27.0
+              elapsed_seconds: 180.0
+              obs_history:
+                - freq: 40.0
+                  fan_out: 750.0
+                  fan_in: 900.0
+                  eev: 165.0
+                  T_out_coil: 35.0
+                  T_in_coil: 25.0
+                  T_out_discharge: 55.0
+                  T_in: 28.35
+                  T_out: 35.0
+                  energy_cum: 0.0
+                  T_set: 27.0
+                  mode: 1.0
+              act_history:
+                - freq_target: 40.0
+                  eev: 165.0
+                  fan_out: 750.0
+              return_debug: false
+      responses:
+        "200":
+          description: A control action was planned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanResponse"
+              example:
+                status: ok
+                request_id: req-001
+                unit_id: ac-001
+                controller_type: hanwam_wm_mpc
+                model_id: hanwam_e007_block_mppi_v7_anchors_band045_e16_eval:0123456789ab
+                action:
+                  freq_target: 40.0
+                  eev: 165.0
+                  fan_out: 750.0
+                valid_for_seconds: 5
+                schema_version: control.plan.v1
+                debug:
+                  planner: mppi
+                  plan_ms: 12.3
+                  history_steps: 36
+                  horizon_steps: 60
+                  rollout_steps: 60
+                  stateful_session: true
+                  reused_cached_action: false
+                  effective_deadline_seconds: 2035.0
+                  deadline_source: auto_first_frame
+                  deadline_recomputed: true
+        "400":
+          $ref: "#/components/responses/UnsupportedRequest"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "500":
+          $ref: "#/components/responses/ConfigError"
+        "503":
+          $ref: "#/components/responses/ServiceNotReady"
+  /v1/reset:
+    post:
+      tags:
+        - control
+      summary: Reset control sessions
+      description: Clears all per-unit runtime control sessions without unloading the model checkpoint.
+      operationId: resetSessions
+      responses:
+        "200":
+          description: Runtime sessions were cleared.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResetResponse"
+              example:
+                status: ok
+                controller_type: hanwam_wm_mpc
+                sessions_cleared: 3
+                schema_version: control.reset.v1
+components:
+  responses:
+    UnsupportedRequest:
+      description: The request is well-formed but incompatible with the configured controller.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            status: error
+            request_id: req-001
+            error_code: UNSUPPORTED_REQUEST
+            message: request mode does not match configured controller mode
+            details:
+              request_mode: 3
+              configured_mode: 1
+    ValidationError:
+      description: The request body failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            status: error
+            request_id: req-001
+            error_code: VALIDATION_ERROR
+            message: request validation failed
+            details:
+              errors: []
+    ConfigError:
+      description: The service or controller configuration is invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ServiceNotReady:
+      description: The service cannot serve control requests yet.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: ok
+      additionalProperties: false
+    ReadyResponse:
+      type: object
+      required:
+        - status
+        - controller_type
+        - model_id
+      properties:
+        status:
+          type: string
+          example: ready
+        controller_type:
+          type: string
+          example: hanwam_wm_mpc
+        model_id:
+          type: string
+          description: Algorithm experiment name plus checkpoint SHA-256 prefix.
+      additionalProperties: false
+    PlanRequest:
+      type: object
+      required:
+        - unit_id
+        - mode
+        - step_seconds
+        - target_temperature_c
+        - obs_history
+        - act_history
+      properties:
+        request_id:
+          type: string
+          nullable: true
+          description: Caller-generated request ID returned unchanged for tracing.
+        unit_id:
+          type: string
+          description: Device ID used to isolate MPPI warm-start state and cached actions.
+          example: ac-001
+        controller_type:
+          type: string
+          nullable: true
+          description: Optional controller type. If omitted, the configured controller is used.
+          example: hanwam_wm_mpc
+        mode:
+          type: integer
+          description: Current working mode. The first `hanwam_wm_mpc` version supports cooling mode `1`.
+          example: 1
+        step_seconds:
+          type: integer
+          description: Control sampling interval in seconds. Current HanWAM checkpoints require `5`.
+          example: 5
+        target_temperature_c:
+          type: number
+          format: double
+          description: Target indoor dry-bulb temperature in degrees Celsius.
+          example: 27.0
+        elapsed_seconds:
+          type: number
+          format: double
+          default: 0.0
+          description: Elapsed time of the current control task in seconds.
+        deadline_seconds:
+          type: number
+          format: double
+          nullable: true
+          description: >-
+            Optional compatibility field. The HanWAM adapter records this value
+            in debug/logs but uses its automatically computed per-unit DDL for
+            planning.
+        obs_history:
+          type: array
+          description: Observation history ordered from oldest to newest.
+          items:
+            $ref: "#/components/schemas/ObservationFrame"
+        act_history:
+          type: array
+          description: Action history ordered from oldest to newest.
+          items:
+            $ref: "#/components/schemas/ActionFrame"
+        return_debug:
+          type: boolean
+          default: false
+          description: >-
+            When true, includes planner fields plus the parsed request body,
+            validated request with defaults, raw-body SHA-256, and byte count.
+      additionalProperties: false
+    ObservationFrame:
+      type: object
+      description: HanWAM observation frame. Required keys are validated by the controller.
+      required:
+        - freq
+        - fan_out
+        - fan_in
+        - eev
+        - T_out_coil
+        - T_in_coil
+        - T_out_discharge
+        - T_in
+        - T_out
+        - energy_cum
+        - T_set
+        - mode
+      properties:
+        freq:
+          type: number
+          format: double
+        fan_out:
+          type: number
+          format: double
+        fan_in:
+          type: number
+          format: double
+        eev:
+          type: number
+          format: double
+        T_out_coil:
+          type: number
+          format: double
+        T_in_coil:
+          type: number
+          format: double
+        T_out_discharge:
+          type: number
+          format: double
+        T_in:
+          type: number
+          format: double
+        T_out:
+          type: number
+          format: double
+        energy_cum:
+          type: number
+          format: double
+        T_set:
+          type: number
+          format: double
+        mode:
+          type: number
+          format: double
+      additionalProperties:
+        type: number
+        format: double
+    ActionFrame:
+      type: object
+      description: HanWAM action frame.
+      required:
+        - freq_target
+        - eev
+        - fan_out
+      properties:
+        freq_target:
+          type: number
+          format: double
+        eev:
+          type: number
+          format: double
+        fan_out:
+          type: number
+          format: double
+      additionalProperties:
+        type: number
+        format: double
+    PlanResponse:
+      type: object
+      required:
+        - status
+        - controller_type
+        - model_id
+        - action
+        - valid_for_seconds
+        - schema_version
+        - debug
+      properties:
+        status:
+          type: string
+          default: ok
+        request_id:
+          type: string
+          nullable: true
+        unit_id:
+          type: string
+          nullable: true
+        controller_type:
+          type: string
+        model_id:
+          type: string
+        action:
+          $ref: "#/components/schemas/PlannedAction"
+        valid_for_seconds:
+          type: integer
+          example: 5
+        schema_version:
+          type: string
+          default: control.plan.v1
+        debug:
+          type: object
+          additionalProperties: true
+      additionalProperties: false
+    PlannedAction:
+      type: object
+      required:
+        - freq_target
+        - eev
+        - fan_out
+      properties:
+        freq_target:
+          type: number
+          format: double
+        eev:
+          type: number
+          format: double
+        fan_out:
+          type: number
+          format: double
+      additionalProperties:
+        type: number
+        format: double
+    MetadataResponse:
+      type: object
+      required:
+        - status
+        - service
+        - logging
+        - controller
+      properties:
+        status:
+          type: string
+          example: ok
+        service:
+          type: object
+          additionalProperties: true
+        logging:
+          type: object
+          additionalProperties: true
+        controller:
+          type: object
+          additionalProperties: true
+      additionalProperties: false
+    ResetResponse:
+      type: object
+      required:
+        - status
+        - controller_type
+        - sessions_cleared
+        - schema_version
+      properties:
+        status:
+          type: string
+          default: ok
+        controller_type:
+          type: string
+          example: hanwam_wm_mpc
+        sessions_cleared:
+          type: integer
+          example: 3
+        schema_version:
+          type: string
+          default: control.reset.v1
+      additionalProperties: false
+    ErrorResponse:
+      type: object
+      required:
+        - status
+        - error_code
+        - message
+        - details
+      properties:
+        status:
+          type: string
+          default: error
+        request_id:
+          type: string
+          nullable: true
+        error_code:
+          type: string
+          example: VALIDATION_ERROR
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+      additionalProperties: false

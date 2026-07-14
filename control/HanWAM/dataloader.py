@@ -80,7 +80,29 @@ def _manifest_map(config: dict | None) -> dict[str, str]:
     if path is None or not path.exists():
         return {}
     frame = pd.read_csv(path)
-    return {str(row["destination"]): str(row["source"]) for _, row in frame.iterrows()}
+    root = project_path(data_cfg.get("root")) or DATA_DIR
+    mapping: dict[str, str] = {}
+    for _, row in frame.iterrows():
+        destination = Path(str(row["destination"]))
+        source = str(row["source"])
+        keys = {str(destination)}
+        if destination.parts and destination.parts[0] == root.name:
+            keys.add(str(Path(*destination.parts[1:])))
+        if not destination.is_absolute():
+            candidate = project_path(destination)
+            if candidate is not None:
+                try:
+                    keys.add(str(candidate.relative_to(root)))
+                except ValueError:
+                    pass
+        else:
+            try:
+                keys.add(str(destination.relative_to(root)))
+            except ValueError:
+                pass
+        for key in keys:
+            mapping[key] = source
+    return mapping
 
 
 def _split_for_path(path: Path, root: Path, config: dict | None, manifest: dict[str, str]) -> str:
@@ -120,6 +142,10 @@ def load_run(path: Path, step_seconds: int = 5, mode: int | None = 1, config: di
     columns = columns_from_config(config)
     interpolation_limit = int((data_cfg.get("sampling") or {}).get("interpolation_limit", 2))
     frame = read_raw_csv(path)
+    if "T_out_discharge" not in frame.columns and "T_out" in frame.columns:
+        frame["T_out_discharge"] = frame["T_out"]
+    elif "T_out_discharge" in frame.columns and "T_out" in frame.columns:
+        frame["T_out_discharge"] = frame["T_out_discharge"].fillna(frame["T_out"])
     needed = list(WAM_REQUIRED_RAW_COLS)
     frame = frame.dropna(subset=needed)
     frame = frame.sort_values("ts").drop_duplicates("ts", keep="last")
@@ -194,97 +220,47 @@ def describe_runs(runs: list[Run], step_seconds: int = 5) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def transition_arrays(
+def block_sequence_arrays(
     runs: list[Run],
     split: str,
-    obs_cols: list[str] | None = None,
-    action_cols: list[str] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    obs_cols = obs_cols or WAM_OBS_COLS
-    action_cols = action_cols or WAM_ACTION_COLS
-    obs, actions, next_obs, keys = [], [], [], []
-    for run in runs:
-        if run.split != split or len(run.frame) < 2:
-            continue
-        frame = run.frame
-        o = frame[obs_cols].to_numpy(np.float32)
-        a = frame[action_cols].to_numpy(np.float32)
-        obs.append(o[:-1])
-        actions.append(a[:-1])
-        next_obs.append(o[1:])
-        keys.extend([run.name] * (len(frame) - 1))
-    if not obs:
-        raise ValueError(f"No transition data for split={split}")
-    return np.concatenate(obs), np.concatenate(actions), np.concatenate(next_obs), keys
-
-
-def policy_transition_arrays(
-    runs: list[Run],
-    split: str,
-    config: dict | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    columns = columns_from_config(config)
-    obs_cols = columns["observation"]
-    actual_cols = columns["actual_action"]
-    target_cols = columns["target_action"]
-    goal_cols = columns["goal"]
-    obs, actual_actions, target_actions, next_obs, goals, keys = [], [], [], [], [], []
-    for run in runs:
-        if run.split != split or len(run.frame) < 2:
-            continue
-        frame = run.frame
-        o = frame[obs_cols].to_numpy(np.float32)
-        obs.append(o[:-1])
-        actual_actions.append(frame[actual_cols].to_numpy(np.float32)[:-1])
-        target_actions.append(frame[target_cols].to_numpy(np.float32)[:-1])
-        next_obs.append(o[1:])
-        goals.append(frame[goal_cols].to_numpy(np.float32)[:-1])
-        keys.extend([run.name] * (len(frame) - 1))
-    if not obs:
-        raise ValueError(f"No transition data for split={split}")
-    return (
-        np.concatenate(obs),
-        np.concatenate(actual_actions),
-        np.concatenate(target_actions),
-        np.concatenate(next_obs),
-        np.concatenate(goals),
-        keys,
-    )
-
-
-def sequence_arrays(
-    runs: list[Run],
-    split: str,
-    horizon_steps: int,
     config: dict | None = None,
     limit: int = 0,
     seed: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
     columns = columns_from_config(config)
     obs_cols = columns["observation"]
     target_cols = columns["target_action"]
     train_cfg = (config or {}).get("train") or {}
-    history_steps = int(train_cfg.get("history_steps", 1))
-    obs_history, actions, future_obs_history, physical, keys = [], [], [], [], []
-    horizon_steps = int(horizon_steps)
-    if horizon_steps < 1:
-        raise ValueError("horizon_steps must be >= 1")
-    if history_steps < 1:
-        raise ValueError("history_steps must be >= 1")
+    frames_per_block = int(train_cfg.get("frames_per_block", 12))
+    history_blocks = int(train_cfg.get("history_blocks", 3))
+    future_blocks = int(train_cfg.get("future_blocks", 5))
+    if frames_per_block < 1:
+        raise ValueError("frames_per_block must be >= 1")
+    if history_blocks < 1:
+        raise ValueError("history_blocks must be >= 1")
+    if future_blocks < 1:
+        raise ValueError("future_blocks must be >= 1")
+    history_steps = history_blocks * frames_per_block
+    future_steps = future_blocks * frames_per_block
 
     eligible: list[tuple[Run, int]] = []
     for run in runs:
-        if run.split != split or len(run.frame) < horizon_steps + 1:
+        if run.split != split or len(run.frame) < history_steps + future_steps + 1:
             continue
-        for start in range(history_steps - 1, len(run.frame) - horizon_steps):
+        for start in range(history_steps - 1, len(run.frame) - future_steps):
             eligible.append((run, start))
     if not eligible:
-        raise ValueError(f"No sequence data for split={split} horizon_steps={horizon_steps} history_steps={history_steps}")
+        raise ValueError(
+            f"No block sequence data for split={split} history_blocks={history_blocks} "
+            f"future_blocks={future_blocks} frames_per_block={frames_per_block}"
+        )
     if limit and int(limit) > 0 and len(eligible) > int(limit):
         rng = np.random.default_rng(seed)
         selected_idx = rng.choice(len(eligible), size=int(limit), replace=False)
         eligible = [eligible[int(idx)] for idx in np.sort(selected_idx)]
 
+    obs_history_blocks, act_history_blocks = [], []
+    future_act_blocks, target_obs_blocks, physical, keys = [], [], [], []
     prepared: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     for run, start in eligible:
         if run.name not in prepared:
@@ -299,22 +275,24 @@ def sequence_arrays(
                 frame[target_cols].to_numpy(np.float32),
                 frame[PHYSICAL_COLS].to_numpy(np.float32),
             )
-        o, a, p = prepared[run.name]
-        end = start + horizon_steps
-        obs_history.append(o[start - history_steps + 1 : start + 1])
-        actions.append(a[start:end])
-        future_obs_history.append(
-            np.stack(
-                [o[future - history_steps + 1 : future + 1] for future in range(start + 1, end + 1)],
-                axis=0,
-            )
-        )
-        physical.append(p[start + 1 : end + 1])
+        obs, actions, phys = prepared[run.name]
+        future_end = start + future_steps
+        history_obs = obs[start - history_steps + 1 : start + 1]
+        history_act = actions[start - history_steps + 1 : start + 1]
+        future_act = actions[start:future_end]
+        future_obs = obs[start + 1 : future_end + 1]
+        physical_target = phys[start + 1 : future_end + 1]
+        obs_history_blocks.append(history_obs.reshape(history_blocks, frames_per_block, len(obs_cols)))
+        act_history_blocks.append(history_act.reshape(history_blocks, frames_per_block, len(target_cols)))
+        future_act_blocks.append(future_act.reshape(future_blocks, frames_per_block, len(target_cols)))
+        target_obs_blocks.append(future_obs.reshape(future_blocks, frames_per_block, len(obs_cols)))
+        physical.append(physical_target)
         keys.append(run.name)
     return (
-        np.asarray(obs_history, dtype=np.float32),
-        np.asarray(actions, dtype=np.float32),
-        np.asarray(future_obs_history, dtype=np.float32),
+        np.asarray(obs_history_blocks, dtype=np.float32),
+        np.asarray(act_history_blocks, dtype=np.float32),
+        np.asarray(future_act_blocks, dtype=np.float32),
+        np.asarray(target_obs_blocks, dtype=np.float32),
         np.asarray(physical, dtype=np.float32),
         keys,
     )

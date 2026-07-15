@@ -13,7 +13,7 @@ import pandas as pd
 
 
 DEFAULT_EXPERIMENTS = [
-    "hanwam_e059_soft_clamp_strong_anchor_v1",
+    "hanwam_roomhybrid_4h",
 ]
 
 
@@ -67,7 +67,7 @@ def _plot_frame(trajectory: pd.DataFrame, controller: pd.DataFrame, path: Path, 
 
     _plot_optional(axes[2], minutes, trajectory, "freq_target", label="freq_target", lw=1.4)
     _plot_optional(axes[2], minutes, trajectory, "freq", label="actual_freq", lw=1.4)
-    axes[2].axhline(15.0, color="gray", lw=0.9, ls=":", label="15Hz threshold")
+    axes[2].axhline(10.0, color="gray", lw=0.9, ls=":", label="10Hz min")
     axes[2].set_ylabel("Compressor (Hz)")
 
     _plot_optional(axes[3], minutes, trajectory, "fan_out", label="fan_out", lw=1.4)

@@ -1,8 +1,10 @@
-# 数据约定
+# Data convention
 
-本仓库只保留数据读取代码，不提交真实 CSV、xlsx、截图或整理结果。训练和评估时请在运行环境外部提供数据目录。
+This clean repository does not include real experiment CSV files. Code keeps
+the same loader contract so local training and evaluation can use an external
+dataset mounted or copied into the expected layout.
 
-默认布局：
+## Expected External Layout
 
 ```text
 data/
@@ -17,6 +19,26 @@ data/
   split_manifest.csv
 ```
 
-`data/dataset` 是 HanWAM 默认训练入口，按工况目录保存整理后的 `status_data_*.csv`。`split_manifest.csv` 用于从整理版文件恢复 train/val/test 来源划分。`data/raw` 只作为原始采集归档，不是默认训练入口。
+`data/dataset/` is the default training and evaluation root. Each grouped
+directory contains GBK or UTF-8 status CSV files named `status_data_*.csv`.
+`data/raw/` is for original collection folders and is not required by the clean
+tests.
 
-测试不会读取仓库内真实数据。需要数据相关单测时，测试会在临时目录生成 mock CSV。
+`split_manifest.csv` is optional. When present, it maps cleaned dataset files
+back to source rounds so loaders can assign train, validation, and test splits.
+Without a manifest, tests and examples can pass an explicit temporary data
+configuration.
+
+## Required Raw Fields
+
+The shared CSV reader reads by column position because source headers have used
+multiple encodings. HanWAM expects these normalized columns after loading:
+
+```text
+ts, T_out, T_out_coil, T_out_discharge, freq, eev, fan_out,
+I_comp, T_in, T_in_coil, fan_in, RH_in, T_set, mode,
+energy_cum, freq_in_tgt
+```
+
+Do not commit real CSVs or derived manifests into this repository. Runtime tests
+generate temporary mock CSVs when schema coverage is needed.

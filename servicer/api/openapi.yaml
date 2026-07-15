@@ -49,7 +49,7 @@ paths:
               example:
                 status: ready
                 controller_type: hanwam_wm_mpc
-                model_id: hanwam_e007_block_mppi_v7_anchors_band045_e16_eval:0123456789ab
+                model_id: hanwam:0123456789ab
         "503":
           $ref: "#/components/responses/ServiceNotReady"
   /v1/metadata:
@@ -126,7 +126,7 @@ paths:
                 request_id: req-001
                 unit_id: ac-001
                 controller_type: hanwam_wm_mpc
-                model_id: hanwam_e007_block_mppi_v7_anchors_band045_e16_eval:0123456789ab
+                model_id: hanwam:0123456789ab
                 action:
                   freq_target: 40.0
                   eev: 165.0

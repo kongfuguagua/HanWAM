@@ -23,10 +23,9 @@ def _payload() -> dict:
 class HanWAMAdapterTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        config_path = Path(__file__).resolve().parents[1] / "config/api_service_hanwam.yml"
-        config = load_api_service_config(config_path)
+        config = load_api_service_config("servicer/config/api_service_hanwam.yml")
         if not config.controller.checkpoint.exists():
-            raise unittest.SkipTest(f"external HanWAM checkpoint not found: {config.controller.checkpoint}")
+            raise unittest.SkipTest(f"external checkpoint missing: {config.controller.checkpoint}")
         cls.controller = build_controller(config)
 
     def setUp(self) -> None:
@@ -35,8 +34,8 @@ class HanWAMAdapterTest(unittest.TestCase):
     def test_metadata_is_ready(self) -> None:
         metadata = self.controller.metadata()
         self.assertEqual(metadata["controller_type"], "hanwam_wm_mpc")
-        self.assertGreater(metadata["history_steps"], 0)
-        self.assertGreater(metadata["rollout_steps"], 0)
+        self.assertEqual(metadata["history_steps"], 36)
+        self.assertEqual(metadata["rollout_steps"], 60)
         self.assertIn("checkpoint_sha256", metadata)
 
     def test_plan_returns_bounded_action(self) -> None:

@@ -1,35 +1,26 @@
-# API Servicer
+# HanWAM API servicer
 
-本目录提供 HTTP JSON 控制服务。服务启动时读取 YAML 配置，实例化 `hanwam_wm_mpc` controller adapter，并按 `unit_id` 维护独立的 MPPI warm-start 和短周期缓存动作。
+This directory provides an HTTP JSON wrapper for online control. The current
+controller adapter is `hanwam_wm_mpc`, which loads the HanWAM config and a local
+checkpoint, then serves `/v1/plan` requests.
 
-## 启动
+## Local Run
 
 ```bash
 python -m servicer.api_servicer.main \
   --config servicer/config/api_service_hanwam.yml
 ```
 
-宿主机配置使用相对路径，默认指向 E065-L10：
+The host config uses repository-relative paths:
 
 ```text
-servicer/config/api_service_hanwam.yml
+algorithm_config: control/HanWAM/config/hanwam.yml
+checkpoint:       control/HanWAM/checkpoints/hanwam_mode1.pt
+log path:         outputs/servicer/hanwam_service.log
 ```
 
-容器配置使用 `/app/...` 绝对路径：
-
-```text
-servicer/config/api_service_hanwam_docker.yml
-```
-
-配置字段包括：
-
-```text
-service.host / service.port / service.num_threads / service.device
-logging.level / logging.mode / logging.path / logging.payloads
-controller.type / controller.algorithm_config / controller.checkpoint
-```
-
-checkpoint 不提交到仓库，启动真实 HanWAM adapter 前需要外部挂载。
+The checkpoint file is not committed. Add a trained local checkpoint before
+starting a real HanWAM service.
 
 ## API
 
@@ -41,7 +32,7 @@ POST /v1/plan
 POST /v1/reset
 ```
 
-`/v1/plan` 主要字段：
+`/v1/plan` accepts:
 
 ```text
 controller_type = hanwam_wm_mpc
@@ -49,36 +40,41 @@ unit_id = ac_xxx
 mode = 1
 step_seconds = 5
 target_temperature_c = 27.0
-elapsed_seconds = 300.0
-obs_history = oldest -> newest
-act_history = oldest -> newest
-deadline_seconds = optional
-return_debug = optional
+elapsed_seconds = current task age in seconds
+obs_history = recent frames, oldest to newest
+act_history = recent actions, oldest to newest
+return_debug = true or false
 ```
 
-HanWAM adapter 会用第一次有效请求的 `obs_history[0].T_in`、`obs_history[0].T_out` 和 `target_temperature_c` 自动计算 DDL，并缓存到对应 `unit_id`。目标温度变化时会重新计算 DDL，同时清空该设备的 planner warm-start 和 cached actions。
-
-`return_debug=true` 时会回显原始请求、校验后请求、请求体 SHA-256 和字节数。请求内容可能包含设备运行数据，联调结束后应关闭。
+The exact history length is reported by `/v1/metadata`; the current HanWAM
+config uses 48 observation/action frames.
 
 ## Docker
 
 ```bash
 make -C servicer docker-build IMAGE_TAG=cpu
-make -C servicer docker-run IMAGE_TAG=cpu OUTPUT_DIR=outputs/servicer
-curl http://127.0.0.1:24243/readyz
+make -C servicer docker-run IMAGE_TAG=cpu
 ```
 
-登录镜像仓库使用环境变量，不要把密码写入文件：
+To push an image, provide registry settings at invocation time instead of
+committing credentials:
 
 ```bash
-export REGISTRY_USERNAME='your-user'
 export REGISTRY_PASSWORD='******'
-make -C servicer docker-login
+make -C servicer docker-release \
+  REGISTRY_HOST=registry.example.com \
+  REGISTRY_USER=my-user \
+  IMAGE_REPO=registry.example.com/team/hanwam-service \
+  IMAGE_TAG=cpu
 ```
 
-## 测试
+## Testing
 
 ```bash
 python -m compileall servicer control/HanWAM control/MiniController
 python -m unittest discover -s servicer/tests
+make -C servicer validate-config
 ```
+
+Adapter tests skip real-checkpoint execution when the external checkpoint is
+absent. API contract tests use a fake controller and do not need model weights.

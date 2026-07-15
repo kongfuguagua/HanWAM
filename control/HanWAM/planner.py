@@ -21,27 +21,6 @@ class PlannerResult:
 
 @dataclass(frozen=True)
 class _FirstPrinciplesObjectiveConfig:
-    band_c: float
-    pre_deadline_band_c: float
-    guard_seconds: float
-    post_deadline_upper_c: float
-    post_deadline_lower_c: float
-    thermal_envelope_weight: float
-    terminal_weight: float
-    energy_weight: float
-    action_weight: float
-    action_first_weight: float
-    action_sequence_weight: float
-    energy_reference_kwh_per_hour: float
-    terminal_tail_seconds: float
-    terminal_projection_max_seconds: float
-    terminal_enabled_only_before_horizon_contains_deadline: bool
-    terminal_slope_method: str
-    terminal_slope_clip: bool
-    terminal_slope_clip_c_per_min: float
-    action_reference: str
-    action_loss: str
-    action_huber_delta: float
     action_history_ema_tau_seconds: float | None
     slew_pre_deadline: tuple[float, float, float] | None
     slew_post_deadline: tuple[float, float, float] | None
@@ -76,50 +55,13 @@ class _FirstPrinciplesObjectiveConfig:
         return parsed
 
     @classmethod
-    def from_planner_config(cls, config: dict, comfort_band_c: float) -> "_FirstPrinciplesObjectiveConfig":
+    def from_planner_config(cls, config: dict) -> "_FirstPrinciplesObjectiveConfig":
         fp = cls._section(config, "first_principles")
-        envelope = cls._section(fp, "envelope")
-        terminal = cls._section(fp, "terminal")
-        energy = cls._section(fp, "energy")
         action = cls._section(fp, "action")
         slew = cls._section(fp, "slew")
-        weights = dict(config.get("cost_weights") or {})
-        weights.update(cls._section(fp, "weights"))
-
-        band_c = fp.get(
-            "band_c",
-            envelope.get(
-                "band_c",
-                weights.get("temperature_band_c", config.get("comfort_band_c", comfort_band_c)),
-            ),
-        )
-        terminal_tail_seconds = fp.get(
-            "terminal_tail_seconds",
-            terminal.get("tail_seconds", config.get("terminal_guard_tail_seconds", 120.0)),
-        )
-        terminal_projection_max_seconds = fp.get(
-            "terminal_projection_max_seconds",
-            terminal.get("projection_max_seconds", config.get("terminal_projection_max_seconds", 600.0)),
-        )
-        energy_reference = fp.get(
-            "energy_reference_kwh_per_hour",
-            energy.get("reference_kwh_per_hour", config.get("energy_reference_kwh_per_hour", 0.6)),
-        )
         ema_tau_seconds = fp.get(
             "action_history_ema_tau_seconds",
             action.get("history_ema_tau_seconds", config.get("action_history_ema_tau_seconds")),
-        )
-        pre_deadline_band = envelope.get(
-            "pre_deadline_band_c",
-            fp.get("pre_deadline_band_c", band_c),
-        )
-        post_upper = envelope.get(
-            "post_deadline_upper_c",
-            fp.get("post_deadline_upper_c", band_c),
-        )
-        post_lower = envelope.get(
-            "post_deadline_lower_c",
-            fp.get("post_deadline_lower_c", band_c),
         )
         pre_slew = cls._optional_slew(
             slew.get("pre_deadline", config.get("slew_pre_deadline"))
@@ -132,34 +74,6 @@ class _FirstPrinciplesObjectiveConfig:
             else config.get("slew_post_deadline")
         )
         return cls(
-            band_c=float(band_c),
-            pre_deadline_band_c=float(pre_deadline_band),
-            guard_seconds=float(envelope.get("guard_seconds", fp.get("guard_seconds", 0.0))),
-            post_deadline_upper_c=float(post_upper),
-            post_deadline_lower_c=float(post_lower),
-            thermal_envelope_weight=float(weights.get("thermal_envelope", 0.0)),
-            terminal_weight=float(weights.get("terminal", 0.0)),
-            energy_weight=float(weights.get("energy", 0.0)),
-            action_weight=float(weights.get("action", 0.0)),
-            action_first_weight=float(weights.get("action_first_weight", action.get("first_weight", 1.0))),
-            action_sequence_weight=float(weights.get("action_sequence_weight", action.get("sequence_weight", 1.0))),
-            energy_reference_kwh_per_hour=float(energy_reference),
-            terminal_tail_seconds=float(terminal_tail_seconds),
-            terminal_projection_max_seconds=float(terminal_projection_max_seconds),
-            terminal_enabled_only_before_horizon_contains_deadline=bool(
-                terminal.get(
-                    "enabled_only_before_horizon_contains_deadline",
-                    config.get("terminal_enabled_only_before_horizon_contains_deadline", False),
-                )
-            ),
-            terminal_slope_method=str(terminal.get("slope_method", config.get("terminal_slope_method", "endpoint"))),
-            terminal_slope_clip=bool(terminal.get("slope_clip", config.get("terminal_slope_clip", False))),
-            terminal_slope_clip_c_per_min=float(
-                terminal.get("slope_clip_c_per_min", config.get("terminal_slope_clip_c_per_min", 0.20))
-            ),
-            action_reference=str(action.get("reference", config.get("action_reference", "history_reference"))),
-            action_loss=str(action.get("loss", config.get("action_loss", "mse"))),
-            action_huber_delta=float(action.get("huber_delta", config.get("action_huber_delta", 0.10))),
             action_history_ema_tau_seconds=cls._optional_float(ema_tau_seconds),
             slew_pre_deadline=pre_slew,
             slew_post_deadline=post_slew,
@@ -198,6 +112,7 @@ class _SamplingPlannerBase:
         self.history_blocks = int(timing.get("history_blocks", config.get("history_blocks", getattr(model, "history_blocks", 3))))
         self.horizon_steps = int(timing.get("horizon_steps", config.get("horizon_steps", self.frames_per_block * self.future_blocks)))
         self.rollout_steps = int(self.frames_per_block * self.future_blocks)
+        self.physical_is_block = bool(getattr(model, "physical_is_block", False))
         if self.horizon_steps > self.rollout_steps:
             raise ValueError(
                 f"planner.horizon_steps={self.horizon_steps} exceeds WM rollout "
@@ -213,35 +128,13 @@ class _SamplingPlannerBase:
         self.min_std_fraction = float(sampling.get("min_std_fraction", config.get("min_std_fraction", 0.02)))
         self.proposal_action_anchors = list(sampling.get("proposal_action_anchors", config.get("proposal_action_anchors") or []))
         self.step_seconds = int(timing.get("step_seconds", config.get("step_seconds", 5)))
-        self.comfort_band_c = float(config.get("comfort_band_c", 0.5))
-        self.comfort_band_reference = str(config.get("comfort_band_reference", "target"))
-        self.objective = str(config.get("objective", "hanwam_e007"))
-        self.reference_schedule = str(config.get("reference_schedule", "deadline_linear"))
+        self.trajectory_step_seconds = float(
+            self.step_seconds * self.frames_per_block if self.physical_is_block else self.step_seconds
+        )
+        self.objective = str(config.get("objective", "phase_energy_clamp"))
         self.compressor_on_threshold_hz = float(actuator.get("compressor_on_threshold_hz", config.get("compressor_on_threshold_hz", 15.0)))
         self.snap_deadband_freq = bool(actuator.get("snap_deadband_freq", config.get("snap_deadband_freq", True)))
-        target_band_margin_seconds = config.get("target_band_margin_seconds")
-        self.target_band_margin_seconds = (
-            None if target_band_margin_seconds is None else float(target_band_margin_seconds)
-        )
-        deadline_band = config.get("deadline_comfort_band_c")
-        self.deadline_comfort_band_c = None if deadline_band is None else float(deadline_band)
-        target_margin_band = config.get("target_margin_comfort_band_c")
-        self.target_margin_comfort_band_c = None if target_margin_band is None else float(target_margin_band)
-        self.deadline_fraction = float(config.get("deadline_fraction", 0.3))
-        self.terminal_guard_band_c = float(
-            config.get(
-                "terminal_guard_band_c",
-                self.target_margin_comfort_band_c
-                if self.target_margin_comfort_band_c is not None
-                else self.comfort_band_c,
-            )
-        )
-        self.terminal_guard_tail_seconds = float(config.get("terminal_guard_tail_seconds", 120.0))
-        self.terminal_guard_projection_seconds = float(config.get("terminal_guard_projection_seconds", 120.0))
-        self.thermal_envelope_lower_weight = float(config.get("thermal_envelope_lower_weight", 1.0))
-        upper_reserve_c = config.get("upper_reserve_c")
-        self.upper_reserve_c = None if upper_reserve_c is None else float(upper_reserve_c)
-        self.first_principles_config = _FirstPrinciplesObjectiveConfig.from_planner_config(config, self.comfort_band_c)
+        self.first_principles_config = _FirstPrinciplesObjectiveConfig.from_planner_config(config)
         self.temperature_source = str(config.get("temperature_source", "delta"))
         self.seed = sampling.get("seed", config.get("seed"))
         self._action_cols = list(WAM_ACTION_COLS)
@@ -522,277 +415,6 @@ class _SamplingPlannerBase:
             sequence = torch.zeros_like(first)
         return float(first_weight) * first + float(sequence_weight) * sequence
 
-    def _first_principles_bounds(
-        self,
-        times: torch.Tensor,
-        initial_t_in: float,
-        target_t: torch.Tensor,
-        remaining_seconds: float | None,
-        band_c: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if remaining_seconds is None or float(remaining_seconds) <= 0.0:
-            upper = target_t + float(band_c)
-            lower = target_t - float(band_c)
-            return (
-                upper.expand_as(times),
-                lower.expand_as(times),
-                torch.ones_like(times, dtype=torch.bool),
-            )
-        remaining = max(float(remaining_seconds), 1.0)
-        progress = torch.clamp(times / remaining, min=0.0, max=1.0)
-        ref = torch.as_tensor(float(initial_t_in), dtype=times.dtype, device=times.device) + (
-            target_t - float(initial_t_in)
-        ) * progress
-        post_deadline = times >= remaining
-        upper = torch.where(post_deadline, target_t + float(band_c), ref + float(band_c))
-        lower = torch.where(
-            post_deadline,
-            target_t - float(band_c),
-            torch.full_like(times, -1.0e6),
-        )
-        return upper, lower, post_deadline
-
-    def _first_principles_future_upper(
-        self,
-        future_seconds: torch.Tensor,
-        initial_t_in: float,
-        target_t: torch.Tensor,
-        remaining_seconds: float | None,
-        band_c: float,
-    ) -> torch.Tensor:
-        if remaining_seconds is None or float(remaining_seconds) <= 0.0:
-            return target_t + float(band_c)
-        remaining = max(float(remaining_seconds), 1.0)
-        progress = torch.clamp(future_seconds / remaining, min=0.0, max=1.0)
-        ref = torch.as_tensor(float(initial_t_in), dtype=future_seconds.dtype, device=future_seconds.device) + (
-            target_t - float(initial_t_in)
-        ) * progress
-        return torch.where(future_seconds >= remaining, target_t + float(band_c), ref + float(band_c))
-
-    def _first_principles_cost(
-        self,
-        temp: torch.Tensor,
-        energy: torch.Tensor,
-        actions: torch.Tensor,
-        target_t: torch.Tensor,
-        initial_t_in: float,
-        remaining_seconds: float | None,
-        act_history_blocks: np.ndarray | None,
-        current_action: np.ndarray | None,
-        times: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        cfg = self.first_principles_config
-        band_c = float(cfg.band_c)
-        band_scale = max(band_c, 1e-6)
-        upper, lower, _ = self._first_principles_bounds(
-            times,
-            initial_t_in,
-            target_t,
-            remaining_seconds,
-            band_c,
-        )
-        upper_err = torch.clamp(temp - upper.view(1, -1), min=0.0)
-        lower_err = torch.clamp(lower.view(1, -1) - temp, min=0.0)
-        thermal_envelope = (upper_err.pow(2) + lower_err.pow(2)).mean(dim=1) / (band_scale * band_scale)
-
-        terminal = torch.zeros_like(thermal_envelope)
-        if temp.shape[1] > 1:
-            tail_steps = max(1, int(round(float(cfg.terminal_tail_seconds) / float(self.step_seconds))))
-            tail_steps = min(tail_steps, temp.shape[1] - 1)
-            terminal_rate_per_step = (temp[:, -1] - temp[:, -1 - tail_steps]) / float(tail_steps)
-            horizon_seconds = float(temp.shape[1] * self.step_seconds)
-            if remaining_seconds is None:
-                projection_seconds = float(cfg.terminal_projection_max_seconds)
-            else:
-                remaining_after_horizon = float(remaining_seconds) - horizon_seconds
-                projection_seconds = (
-                    min(remaining_after_horizon, float(cfg.terminal_projection_max_seconds))
-                    if remaining_after_horizon > 0.0
-                    else float(cfg.terminal_projection_max_seconds)
-                )
-            projection_steps = max(1.0, projection_seconds / float(self.step_seconds))
-            future_seconds = times[-1] + temp.new_tensor(float(projection_seconds))
-            future_upper = self._first_principles_future_upper(
-                future_seconds,
-                initial_t_in,
-                target_t,
-                remaining_seconds,
-                band_c,
-            )
-            projected_temp = temp[:, -1] + terminal_rate_per_step * projection_steps
-            terminal = torch.clamp(projected_temp - future_upper, min=0.0).pow(2) / (band_scale * band_scale)
-
-        energy_ref = max(
-            float(cfg.energy_reference_kwh_per_hour) * float(temp.shape[1] * self.step_seconds) / 3600.0,
-            1e-6,
-        )
-        energy_normalized = energy.sum(dim=1) / energy_ref
-
-        action = self._chunk_action_cost(
-            actions,
-            act_history_blocks,
-            current_action,
-            first_weight=float(cfg.action_first_weight),
-            sequence_weight=float(cfg.action_sequence_weight),
-        )
-        parts = {
-            "thermal_envelope": thermal_envelope * float(cfg.thermal_envelope_weight),
-            "terminal": terminal * float(cfg.terminal_weight),
-            "energy": energy_normalized * float(cfg.energy_weight),
-            "action": action * float(cfg.action_weight),
-        }
-        return sum(parts.values()), parts
-
-    def _first_principles_robust_bounds(
-        self,
-        times: torch.Tensor,
-        initial_t_in: float,
-        target_t: torch.Tensor,
-        remaining_seconds: float | None,
-        cfg: _FirstPrinciplesObjectiveConfig,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if remaining_seconds is None or float(remaining_seconds) <= 0.0:
-            upper = target_t + float(cfg.post_deadline_upper_c)
-            lower = target_t - float(cfg.post_deadline_lower_c)
-            return upper.expand_as(times), lower.expand_as(times), torch.ones_like(times)
-        remaining = max(float(remaining_seconds), 1.0)
-        progress = torch.clamp(times / remaining, min=0.0, max=1.0)
-        ref = torch.as_tensor(float(initial_t_in), dtype=times.dtype, device=times.device) + (
-            target_t - float(initial_t_in)
-        ) * progress
-        pre_upper = ref + float(cfg.pre_deadline_band_c)
-        post_upper = target_t + float(cfg.post_deadline_upper_c)
-        post_lower = target_t - float(cfg.post_deadline_lower_c)
-        post_deadline = times >= remaining
-        guard = max(float(cfg.guard_seconds), 0.0)
-        if guard > 0.0:
-            guard_start = max(remaining - guard, 0.0)
-            guard_width = max(remaining - guard_start, 1.0)
-            guard_fraction = torch.clamp((times - guard_start) / guard_width, min=0.0, max=1.0)
-        else:
-            guard_fraction = torch.zeros_like(times)
-        upper = torch.where(
-            post_deadline,
-            post_upper.expand_as(times),
-            pre_upper * (1.0 - guard_fraction) + post_upper * guard_fraction,
-        )
-        lower_weight = torch.where(post_deadline, torch.ones_like(times), guard_fraction)
-        lower = torch.where(
-            (lower_weight > 0.0) | post_deadline,
-            post_lower.expand_as(times),
-            torch.full_like(times, -1.0e6),
-        )
-        return upper, lower, lower_weight
-
-    def _first_principles_robust_future_upper(
-        self,
-        future_seconds: torch.Tensor,
-        initial_t_in: float,
-        target_t: torch.Tensor,
-        remaining_seconds: float | None,
-        cfg: _FirstPrinciplesObjectiveConfig,
-    ) -> torch.Tensor:
-        upper, _, _ = self._first_principles_robust_bounds(
-            future_seconds.reshape(-1),
-            initial_t_in,
-            target_t,
-            remaining_seconds,
-            cfg,
-        )
-        return upper.reshape(future_seconds.shape)
-
-    def _terminal_temperature_slope(self, temp: torch.Tensor, tail_steps: int, cfg: _FirstPrinciplesObjectiveConfig) -> torch.Tensor:
-        tail_steps = min(max(1, int(tail_steps)), temp.shape[1] - 1)
-        if str(cfg.terminal_slope_method) in {"robust_linear", "linear"} and tail_steps >= 2:
-            tail = temp[:, -tail_steps:]
-            x = torch.arange(tail.shape[1], dtype=temp.dtype, device=temp.device)
-            x = x - x.mean()
-            denom = x.pow(2).sum().clamp_min(1e-6)
-            y = tail - tail.mean(dim=1, keepdim=True)
-            slope = (y * x.view(1, -1)).sum(dim=1) / denom
-        else:
-            slope = (temp[:, -1] - temp[:, -1 - tail_steps]) / float(tail_steps)
-        if bool(cfg.terminal_slope_clip):
-            max_per_step = float(cfg.terminal_slope_clip_c_per_min) * float(self.step_seconds) / 60.0
-            slope = torch.clamp(slope, min=-max_per_step, max=max_per_step)
-        return slope
-
-    def _first_principles_robust_cost(
-        self,
-        temp: torch.Tensor,
-        energy: torch.Tensor,
-        actions: torch.Tensor,
-        target_t: torch.Tensor,
-        initial_t_in: float,
-        remaining_seconds: float | None,
-        act_history_blocks: np.ndarray | None,
-        current_action: np.ndarray | None,
-        times: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        cfg = self.first_principles_config
-        band_scale = max(float(cfg.pre_deadline_band_c), float(cfg.post_deadline_upper_c), float(cfg.post_deadline_lower_c), 1e-6)
-        upper, lower, lower_weight = self._first_principles_robust_bounds(
-            times,
-            initial_t_in,
-            target_t,
-            remaining_seconds,
-            cfg,
-        )
-        upper_err = torch.clamp(temp - upper.view(1, -1), min=0.0)
-        lower_err = torch.clamp(lower.view(1, -1) - temp, min=0.0) * lower_weight.view(1, -1)
-        thermal_envelope = (upper_err.pow(2) + lower_err.pow(2)).mean(dim=1) / (band_scale * band_scale)
-
-        terminal = torch.zeros_like(thermal_envelope)
-        horizon_seconds = float(temp.shape[1] * self.step_seconds)
-        terminal_allowed = remaining_seconds is not None and float(remaining_seconds) > horizon_seconds
-        if (
-            temp.shape[1] > 1
-            and terminal_allowed
-            and (not cfg.terminal_enabled_only_before_horizon_contains_deadline or float(remaining_seconds) > horizon_seconds)
-        ):
-            projection_seconds = min(
-                float(remaining_seconds) - horizon_seconds,
-                float(cfg.terminal_projection_max_seconds),
-            )
-            if projection_seconds > 0.0:
-                tail_steps = max(1, int(round(float(cfg.terminal_tail_seconds) / float(self.step_seconds))))
-                tail_steps = min(tail_steps, temp.shape[1] - 1)
-                terminal_rate_per_step = self._terminal_temperature_slope(temp, tail_steps, cfg)
-                projection_steps = max(1.0, projection_seconds / float(self.step_seconds))
-                future_seconds = times[-1] + temp.new_tensor(float(projection_seconds))
-                future_upper = self._first_principles_robust_future_upper(
-                    future_seconds,
-                    initial_t_in,
-                    target_t,
-                    remaining_seconds,
-                    cfg,
-                )
-                projected_temp = temp[:, -1] + terminal_rate_per_step * projection_steps
-                terminal = torch.clamp(projected_temp - future_upper, min=0.0).pow(2) / (band_scale * band_scale)
-
-        energy_ref = max(
-            float(cfg.energy_reference_kwh_per_hour) * float(temp.shape[1] * self.step_seconds) / 3600.0,
-            1e-6,
-        )
-        energy_normalized = energy.sum(dim=1) / energy_ref
-        action = self._chunk_action_cost(
-            actions,
-            act_history_blocks,
-            current_action,
-            first_weight=float(cfg.action_first_weight),
-            sequence_weight=float(cfg.action_sequence_weight),
-            reference=str(cfg.action_reference),
-            loss=str(cfg.action_loss),
-            huber_delta=float(cfg.action_huber_delta),
-        )
-        parts = {
-            "thermal_envelope": thermal_envelope * float(cfg.thermal_envelope_weight),
-            "terminal": terminal * float(cfg.terminal_weight),
-            "energy": energy_normalized * float(cfg.energy_weight),
-            "action": action * float(cfg.action_weight),
-        }
-        return sum(parts.values()), parts
-
     @staticmethod
     def _batch_masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         if mask.ndim == 1:
@@ -812,6 +434,7 @@ class _SamplingPlannerBase:
         act_history_blocks: np.ndarray | None,
         current_action: np.ndarray | None,
         times: torch.Tensor,
+        trajectory_step_seconds: float,
         include_energy: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         fp = _FirstPrinciplesObjectiveConfig._section(self.config, "first_principles")
@@ -836,7 +459,7 @@ class _SamplingPlannerBase:
             remaining = max(float(remaining_seconds), 1.0)
             pre_deadline = times < remaining
             post_deadline = ~pre_deadline
-            effective_deadline = max(remaining * reach_fraction, float(self.step_seconds))
+            effective_deadline = max(remaining * reach_fraction, float(trajectory_step_seconds))
             progress = torch.clamp(times / effective_deadline, min=0.0, max=1.0)
             ref = torch.as_tensor(float(initial_t_in), dtype=times.dtype, device=times.device) + (
                 target_t - float(initial_t_in)
@@ -860,11 +483,14 @@ class _SamplingPlannerBase:
         clamp = self._batch_masked_mean(upper_err.pow(2) + lower_err.pow(2) + center_err, clamp_mask)
         terminal_weight = max(float(phase.get("clamp_terminal_weight", 0.0)), 0.0)
         if terminal_weight > 0.0 and temp.shape[1] > 1:
-            tail_steps = max(1, int(round(float(phase.get("clamp_terminal_tail_seconds", 120.0)) / float(self.step_seconds))))
+            tail_steps = max(
+                1,
+                int(round(float(phase.get("clamp_terminal_tail_seconds", 120.0)) / float(trajectory_step_seconds))),
+            )
             tail_steps = min(tail_steps, temp.shape[1] - 1)
             projection_steps = max(
                 1.0,
-                float(phase.get("clamp_terminal_projection_seconds", 600.0)) / float(self.step_seconds),
+                float(phase.get("clamp_terminal_projection_seconds", 600.0)) / float(trajectory_step_seconds),
             )
             tail_rate = (temp[:, -1] - temp[:, -1 - tail_steps]) / float(tail_steps)
             projected = temp[:, -1] + tail_rate * projection_steps
@@ -905,8 +531,11 @@ class _SamplingPlannerBase:
                 deltas = torch.cat([first_delta, seq_delta], dim=1)
             else:
                 deltas = first_delta
-            chunk_idx = torch.arange(self.num_chunks, dtype=torch.long, device=actions.device) * int(self.chunk_steps)
-            chunk_idx = torch.clamp(chunk_idx, max=max(int(temp.shape[1]) - 1, 0))
+            if self.physical_is_block and temp.shape[1] == self.num_chunks:
+                chunk_idx = torch.arange(self.num_chunks, dtype=torch.long, device=actions.device)
+            else:
+                chunk_idx = torch.arange(self.num_chunks, dtype=torch.long, device=actions.device) * int(self.chunk_steps)
+                chunk_idx = torch.clamp(chunk_idx, max=max(int(temp.shape[1]) - 1, 0))
             chunk_temp = temp.index_select(1, chunk_idx)
             current_error = torch.full(
                 (temp.shape[0], 1),
@@ -975,8 +604,11 @@ class _SamplingPlannerBase:
             excess = torch.clamp((chunks - anchor).abs() - deadband_action, min=0.0) / action_range
             gate_c = max(float(action_cfg.get("anchor_gate_c", 0.0)), 0.0)
             if gate_c > 0.0:
-                chunk_idx = torch.arange(self.num_chunks, dtype=torch.long, device=actions.device) * int(self.chunk_steps)
-                chunk_idx = torch.clamp(chunk_idx, max=max(int(temp.shape[1]) - 1, 0))
+                if self.physical_is_block and temp.shape[1] == self.num_chunks:
+                    chunk_idx = torch.arange(self.num_chunks, dtype=torch.long, device=actions.device)
+                else:
+                    chunk_idx = torch.arange(self.num_chunks, dtype=torch.long, device=actions.device) * int(self.chunk_steps)
+                    chunk_idx = torch.clamp(chunk_idx, max=max(int(temp.shape[1]) - 1, 0))
                 chunk_temp = temp.index_select(1, chunk_idx)
                 current_error = torch.full(
                     (temp.shape[0], 1),
@@ -1006,7 +638,7 @@ class _SamplingPlannerBase:
                 )
             )
             energy_ref = max(
-                energy_ref_per_hour * float(temp.shape[1] * self.step_seconds) / 3600.0,
+                energy_ref_per_hour * float(temp.shape[1] * trajectory_step_seconds) / 3600.0,
                 1e-6,
             )
             energy_weight = float(weights.get(f"energy_{action_phase}", weights.get("energy", 0.0)))
@@ -1037,23 +669,60 @@ class _SamplingPlannerBase:
         actions: torch.Tensor,
         obs_history_blocks: np.ndarray | None,
         act_history_blocks: np.ndarray | None,
+        prepared_context=None,
     ) -> torch.Tensor:
-        obs_blocks, act_blocks = self._history_blocks(observation, current_action, obs_history_blocks, act_history_blocks)
+        future_act_blocks = self._future_blocks_from_actions(actions)
+        future_act_n = self._normalize_actions(future_act_blocks)
+        if prepared_context is not None:
+            _, physical_n = self.model.rollout_prepared(prepared_context, future_act_n)
+        else:
+            obs_blocks, act_blocks = self._history_blocks(
+                observation,
+                current_action,
+                obs_history_blocks,
+                act_history_blocks,
+            )
+            obs_n = torch.as_tensor(
+                self.obs_norm.encode(obs_blocks)[None],
+                dtype=torch.float32,
+                device=self.device,
+            ).expand(actions.shape[0], -1, -1, -1)
+            act_hist_n = torch.as_tensor(
+                self.action_norm.encode(act_blocks)[None],
+                dtype=torch.float32,
+                device=self.device,
+            ).expand(actions.shape[0], -1, -1, -1)
+            _, physical_n = self.model.rollout(obs_n, act_hist_n, future_act_n)
+        physical = self._decode_physical(physical_n)
+        limit = self.future_blocks if self.physical_is_block else self.horizon_steps
+        return physical[:, :limit, :]
+
+    def _prepare_rollout_context(
+        self,
+        observation: np.ndarray,
+        current_action: np.ndarray,
+        obs_history_blocks: np.ndarray | None,
+        act_history_blocks: np.ndarray | None,
+    ):
+        if not hasattr(self.model, "prepare_context") or not hasattr(self.model, "rollout_prepared"):
+            return None
+        obs_blocks, act_blocks = self._history_blocks(
+            observation,
+            current_action,
+            obs_history_blocks,
+            act_history_blocks,
+        )
         obs_n = torch.as_tensor(
             self.obs_norm.encode(obs_blocks)[None],
             dtype=torch.float32,
             device=self.device,
-        ).expand(actions.shape[0], -1, -1, -1)
-        act_hist_n = torch.as_tensor(
+        )
+        act_n = torch.as_tensor(
             self.action_norm.encode(act_blocks)[None],
             dtype=torch.float32,
             device=self.device,
-        ).expand(actions.shape[0], -1, -1, -1)
-        future_act_blocks = self._future_blocks_from_actions(actions)
-        future_act_n = self._normalize_actions(future_act_blocks)
-        _, physical_n = self.model.rollout(obs_n, act_hist_n, future_act_n)
-        physical = self._decode_physical(physical_n)
-        return physical[:, : self.horizon_steps, :]
+        )
+        return self.model.prepare_context(obs_n, act_n)
 
     def _cost(
         self,
@@ -1067,7 +736,7 @@ class _SamplingPlannerBase:
         act_history_blocks: np.ndarray | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         idx = {name: i for i, name in enumerate(self.physical_cols)}
-        steps = int(actions.shape[1])
+        steps = int(physical.shape[1])
         if self.temperature_source == "delta" and "T_in_delta" in idx:
             delta = physical[:, :, idx["T_in_delta"]]
             temp = torch.as_tensor(float(initial_t_in), dtype=delta.dtype, device=delta.device) + torch.cumsum(delta, dim=1)
@@ -1075,183 +744,27 @@ class _SamplingPlannerBase:
             temp = physical[:, :, idx["T_in"]]
         energy = torch.clamp(physical[:, :, idx["electric_kwh_delta"]], min=0.0)
         target_t = torch.as_tensor(float(target), dtype=temp.dtype, device=temp.device)
-        times = torch.arange(1, steps + 1, dtype=temp.dtype, device=temp.device) * float(self.step_seconds)
-        if self.objective in {"hanwam_e060_phase_energy_clamp_v1", "phase_energy_clamp"}:
-            return self._first_principles_phase_clamp_cost(
-                temp,
-                energy,
-                actions,
-                target_t,
-                initial_t_in,
-                remaining_seconds,
-                act_history_blocks,
-                current_action,
-                times,
-                include_energy=True,
-            )
-        if self.objective in {"hanwam_e057_phase_aware_clamp_v1", "phase_aware_clamp"}:
-            return self._first_principles_phase_clamp_cost(
-                temp,
-                energy,
-                actions,
-                target_t,
-                initial_t_in,
-                remaining_seconds,
-                act_history_blocks,
-                current_action,
-                times,
-            )
-        if self.objective in {"hanwam_e056_first_principles_robust_envelope_v1", "first_principles_robust_envelope"}:
-            return self._first_principles_robust_cost(
-                temp,
-                energy,
-                actions,
-                target_t,
-                initial_t_in,
-                remaining_seconds,
-                act_history_blocks,
-                current_action,
-                times,
-            )
-        if self.objective in {"hanwam_e055_first_principles_envelope_v1", "first_principles_envelope"}:
-            return self._first_principles_cost(
-                temp,
-                energy,
-                actions,
-                target_t,
-                initial_t_in,
-                remaining_seconds,
-                act_history_blocks,
-                current_action,
-                times,
-            )
-        if self.reference_schedule == "deadline_linear" and remaining_seconds is not None:
-            effective_remaining = max(
-                float(remaining_seconds) * self.deadline_fraction,
-                float(steps * self.step_seconds),
-            )
-            progress = torch.clamp(times / max(effective_remaining, 1.0), min=0.0, max=1.0)
-            ref = torch.as_tensor(float(initial_t_in), dtype=temp.dtype, device=temp.device) + (
-                target_t - float(initial_t_in)
-            ) * progress
-        else:
-            ref = torch.full((steps,), float(target), dtype=temp.dtype, device=temp.device)
-        if self.comfort_band_reference in {"reference", "ref", "schedule", "deadline_linear"}:
-            comfort_ref = ref.view(1, -1)
-        elif self.comfort_band_reference in {"schedule_then_target", "deadline_then_target"}:
-            comfort_ref = ref.view(1, -1).expand_as(temp)
-            if remaining_seconds is not None:
-                margin = float(self.target_band_margin_seconds or 0.0)
-                target_zone = (float(remaining_seconds) - times) <= margin
-                comfort_ref = torch.where(target_zone.view(1, -1), target_t.expand_as(temp), comfort_ref)
-        else:
-            comfort_ref = target_t
-        comfort_band_violation = torch.clamp((temp - comfort_ref).abs() - float(self.comfort_band_c), min=0.0).pow(2).mean(dim=1)
-        target_abs_error = (temp - target_t).abs()
-        deadline_band_c = float(
-            self.deadline_comfort_band_c if self.deadline_comfort_band_c is not None else self.comfort_band_c
+        times = torch.arange(1, steps + 1, dtype=temp.dtype, device=temp.device) * float(
+            self.trajectory_step_seconds
         )
-        target_margin_band_c = float(
-            self.target_margin_comfort_band_c
-            if self.target_margin_comfort_band_c is not None
-            else self.comfort_band_c
-        )
-        deadline_band_error = torch.clamp(target_abs_error - deadline_band_c, min=0.0).pow(2)
-        target_margin_error = torch.clamp(target_abs_error - target_margin_band_c, min=0.0).pow(2)
-        if remaining_seconds is not None:
-            remaining = float(remaining_seconds)
-            post_deadline_mask = (remaining - times) <= 0.0
-            margin = float(self.target_band_margin_seconds or 0.0)
-            target_margin_mask = (remaining - times) <= margin
-        else:
-            post_deadline_mask = torch.zeros_like(times, dtype=torch.bool)
-            target_margin_mask = torch.zeros_like(times, dtype=torch.bool)
-
-        def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-            mask_f = mask.to(dtype=values.dtype, device=values.device).view(1, -1)
-            denom = mask_f.sum().clamp_min(1.0)
-            return (values * mask_f).sum(dim=1) / denom
-
-        deadline_band_violation = masked_mean(deadline_band_error, post_deadline_mask)
-        target_margin_band_violation = masked_mean(target_margin_error, target_margin_mask)
-        target_center = masked_mean((temp - target_t).pow(2), target_margin_mask)
-        if temp.shape[1] > 1:
-            temp_rate_error = (temp[:, 1:] - temp[:, :-1]).pow(2)
-            temp_rate_mask = target_margin_mask[1:] | target_margin_mask[:-1]
-            temperature_rate = masked_mean(temp_rate_error, temp_rate_mask)
-        else:
-            temperature_rate = torch.zeros_like(deadline_band_violation)
-        energy_sum = energy.sum(dim=1)
-        action_range = torch.as_tensor(self._range, dtype=actions.dtype, device=actions.device).view(1, 1, -1)
-        if actions.shape[1] > 1:
-            seq_smooth = ((actions[:, 1:] - actions[:, :-1]) / action_range).pow(2).mean(dim=(1, 2))
-        else:
-            seq_smooth = torch.zeros_like(energy_sum)
-        current = self._current_action_from_observation(observation, current_action)
-        current_action_t = torch.as_tensor(current, dtype=actions.dtype, device=actions.device).view(1, 1, -1)
-        first_smooth = ((actions[:, :1, :] - current_action_t) / action_range).pow(2).mean(dim=(1, 2))
-        action_smooth = 0.5 * seq_smooth + 0.5 * first_smooth
-        w = self.cost_weights
-        if self.objective in {"hanwam_e040_phase_envelope", "phase_envelope"}:
-            upper_ref = ref.view(1, -1).expand_as(temp)
-            target_zone_mask = torch.ones_like(times, dtype=torch.bool) if remaining_seconds is None else target_margin_mask
-            upper_ref = torch.where(target_zone_mask.view(1, -1), target_t.expand_as(temp), upper_ref)
-            upper_bound = upper_ref + float(self.comfort_band_c)
-            lower_bound = target_t - float(self.comfort_band_c)
-            thermal_upper_envelope = torch.clamp(temp - upper_bound, min=0.0).pow(2).mean(dim=1)
-            thermal_lower_envelope = (
-                torch.clamp(lower_bound - temp, min=0.0).pow(2).mean(dim=1)
-                * float(self.thermal_envelope_lower_weight)
+        if self.objective != "phase_energy_clamp":
+            raise ValueError(
+                "Unsupported HanWAM planner objective "
+                f"{self.objective!r}; current code keeps only phase_energy_clamp."
             )
-            if self.upper_reserve_c is None:
-                upper_reserve = torch.zeros_like(energy_sum)
-            else:
-                reserve_error = torch.clamp(temp - (target_t + float(self.upper_reserve_c)), min=0.0).pow(2)
-                upper_reserve = masked_mean(reserve_error, target_zone_mask)
-            terminal_invariant = torch.zeros_like(energy_sum)
-            if bool(target_zone_mask.any().detach().cpu().item()) and temp.shape[1] > 1:
-                tail_steps = max(1, int(round(float(self.terminal_guard_tail_seconds) / float(self.step_seconds))))
-                tail_steps = min(tail_steps, temp.shape[1] - 1)
-                projection_steps = max(
-                    1,
-                    int(round(float(self.terminal_guard_projection_seconds) / float(self.step_seconds))),
-                )
-                terminal_rate = (temp[:, -1] - temp[:, -1 - tail_steps]) / float(tail_steps)
-                projected_upper = temp[:, -1] + torch.clamp(terminal_rate, min=0.0) * float(projection_steps)
-                projected_lower = temp[:, -1] + torch.clamp(terminal_rate, max=0.0) * float(projection_steps)
-                terminal_upper = torch.clamp(
-                    projected_upper - (target_t + float(self.terminal_guard_band_c)),
-                    min=0.0,
-                ).pow(2)
-                terminal_lower = torch.clamp(
-                    (target_t - float(self.terminal_guard_band_c)) - projected_lower,
-                    min=0.0,
-                ).pow(2)
-                terminal_invariant = terminal_upper + terminal_lower
-            envelope_weight = float(w.get("thermal_envelope", 0.0))
-            parts = {
-                "thermal_upper_envelope": thermal_upper_envelope
-                * float(w.get("thermal_upper_envelope", envelope_weight)),
-                "thermal_lower_envelope": thermal_lower_envelope
-                * float(w.get("thermal_lower_envelope", envelope_weight)),
-                "upper_reserve": upper_reserve * float(w.get("upper_reserve", 0.0)),
-                "terminal_invariant": terminal_invariant * float(w.get("terminal_invariant", 0.0)),
-                "energy": energy_sum * float(w.get("energy", 2.0)),
-                "action_smooth": action_smooth * float(w.get("action_smooth", 0.20)),
-            }
-            return sum(parts.values()), parts
-
-        parts = {
-            "comfort_band_violation": comfort_band_violation * float(w.get("comfort_band_violation", 0.0)),
-            "deadline_band_violation": deadline_band_violation * float(w.get("deadline_band_violation", 0.0)),
-            "target_margin_band_violation": target_margin_band_violation
-            * float(w.get("target_margin_band_violation", 0.0)),
-            "target_center": target_center * float(w.get("target_center", 0.0)),
-            "temperature_rate": temperature_rate * float(w.get("temperature_rate", 0.0)),
-            "energy": energy_sum * float(w.get("energy", 2.0)),
-            "action_smooth": action_smooth * float(w.get("action_smooth", 0.20)),
-        }
-        return sum(parts.values()), parts
+        return self._first_principles_phase_clamp_cost(
+            temp,
+            energy,
+            actions,
+            target_t,
+            initial_t_in,
+            remaining_seconds,
+            act_history_blocks,
+            current_action,
+            times,
+            trajectory_step_seconds=self.trajectory_step_seconds,
+            include_energy=True,
+        )
 
     def _evaluate_actions(
         self,
@@ -1262,8 +775,16 @@ class _SamplingPlannerBase:
         obs_history_blocks: np.ndarray | None,
         act_history_blocks: np.ndarray | None,
         current_action: np.ndarray,
+        prepared_context=None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        physical = self._rollout_physical(observation, current_action, actions, obs_history_blocks, act_history_blocks)
+        physical = self._rollout_physical(
+            observation,
+            current_action,
+            actions,
+            obs_history_blocks,
+            act_history_blocks,
+            prepared_context=prepared_context,
+        )
         initial_t_in = float(observation[self._obs_index["T_in"]])
         return self._cost(
             physical,
@@ -1356,6 +877,12 @@ class MPPIPlanner(_SamplingPlannerBase):
         best_seq = None
         best_parts = None
         anchor_chunks = self._proposal_anchor_chunks()
+        prepared_context = self._prepare_rollout_context(
+            observation,
+            current,
+            obs_history_blocks,
+            act_history_blocks,
+        )
 
         for iteration in range(self.num_iterations):
             noise = torch.randn(
@@ -1381,6 +908,7 @@ class MPPIPlanner(_SamplingPlannerBase):
                 obs_history_blocks,
                 act_history_blocks,
                 current,
+                prepared_context=prepared_context,
             )
             scaled = -(cost - cost.min()) / max(float(self.temperature), 1e-6)
             weights = torch.softmax(scaled, dim=0)
@@ -1416,6 +944,7 @@ class MPPIPlanner(_SamplingPlannerBase):
             obs_history_blocks,
             act_history_blocks,
             current,
+            prepared_context=prepared_context,
         )
         nominal_seq = nominal_actions_t[0].detach().cpu().numpy()
         self._nominal_actions = nominal_seq.astype(np.float32)
@@ -1432,4 +961,6 @@ class MPPIPlanner(_SamplingPlannerBase):
         if best_parts is not None:
             for name, value in best_parts.items():
                 debug[f"hanwam_best_sample_cost_{name}"] = value
+        debug["hanwam_history_encode_count"] = 1 if prepared_context is not None else self.num_samples * self.num_iterations
+        debug["hanwam_physical_horizon_nodes"] = self.future_blocks if self.physical_is_block else self.horizon_steps
         return PlannerResult(action=action, best_sequence=nominal_seq, debug=debug, history=pd.DataFrame(history_rows))

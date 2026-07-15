@@ -55,10 +55,10 @@ class ContinuousEnthalpyRoomEnv:
     def __init__(
         self,
         model_path: str | Path = DEFAULT_MODEL_PATH,
-        use_physics_offcycle: bool | None = None,
         passive_heat_tau_seconds: float | None = None,
         active_cooling_gain: float = 0.0,
         active_cooling_band: float = 0.0,
+        use_physics_offcycle: bool = True,
     ):
         _install_sklearn_loss_compatibility()
         payload = joblib.load(model_path)
@@ -78,6 +78,11 @@ class ContinuousEnthalpyRoomEnv:
             passive_tau if passive_heat_tau_seconds is None else passive_heat_tau_seconds
         )
         self.metadata = payload.get("metadata", {})
+        offcycle = payload.get("offcycle", {})
+        self.use_physics_offcycle = bool(payload.get("use_physics_offcycle", use_physics_offcycle))
+        self.freq_zero_threshold = float(payload.get("freq_zero_threshold", self.FREQ_ZERO_THRESHOLD))
+        self.offcycle_b = float(payload.get("offcycle_b", offcycle.get("b", self.OFFCYCLE_B)))
+        self.offcycle_c = float(payload.get("offcycle_c", offcycle.get("c", self.OFFCYCLE_C)))
         # Feature configuration for autoregressive variants. Missing config means
         # an older model trained before physics-aware batches were added; default
         # all batches to False to preserve exact feature dimensions.
@@ -97,16 +102,6 @@ class ContinuousEnthalpyRoomEnv:
         self.heat_load = StandardHeatLoadServo(
             HeatLoadServoConfig(**payload.get("heat_load_config", {}))
         )
-
-        # Hybrid off-cycle physics fallback: when the compressor is off, use a
-        # simple heat-balance model instead of the ML model's EWM-based target.
-        # Default is True; pass use_physics_offcycle=False to get the old ML-only
-        # behavior (e.g. for benchmarking the original bug).
-        self.use_physics_offcycle = True if use_physics_offcycle is None else bool(use_physics_offcycle)
-        self.offcycle_b = self.OFFCYCLE_B
-        self.offcycle_c = self.OFFCYCLE_C
-        self.freq_zero_threshold = self.FREQ_ZERO_THRESHOLD
-        self._outdoor_temperature: float = 0.0
         self.compressor_off_freq_hz = float(payload.get("compressor_off_freq_hz", 1.0))
         self.autoregressive_horizon = int(payload.get("autoregressive_horizon", 1))
 

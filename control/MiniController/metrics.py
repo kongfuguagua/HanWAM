@@ -21,11 +21,14 @@ def summarize_closed_loop(
     frame: pd.DataFrame,
     target: float,
     comfort_band_c: float = 0.5,
+    comfort_lower_band_c: float | None = None,
+    comfort_upper_band_c: float | None = None,
     settle_hold_seconds: float = 300.0,
     ddl_seconds: float | None = None,
     require_final_in_band: bool = True,
     reach_deadline_seconds: float | None = None,
     require_post_reach_band: bool = False,
+    require_post_deadline_band: bool = False,
 ) -> dict:
     if frame.empty:
         raise ValueError("Cannot summarize an empty trajectory")
@@ -33,7 +36,11 @@ def summarize_closed_loop(
     elapsed = frame["elapsed_seconds"].to_numpy(dtype=float)
     error = temp - float(target)
     abs_error = np.abs(error)
-    within_band = abs_error <= comfort_band_c
+    lower_band = float(comfort_band_c if comfort_lower_band_c is None else comfort_lower_band_c)
+    upper_band = float(comfort_band_c if comfort_upper_band_c is None else comfort_upper_band_c)
+    if lower_band < 0.0 or upper_band < 0.0:
+        raise ValueError("comfort bands must be non-negative magnitudes")
+    within_band = (error >= -lower_band) & (error <= upper_band)
     reached = np.flatnonzero(within_band)
     best_idx = int(np.nanargmin(abs_error))
     electric_kwh = float(frame["electric_kwh"].sum()) if "electric_kwh" in frame else 0.0
@@ -64,9 +71,11 @@ def summarize_closed_loop(
         success = bool(np.isfinite(sustained_reach_time)) and bool(sustained_reach_time <= reach_deadline)
     else:
         success = bool(len(reached)) and bool(reach_time <= reach_deadline)
+    if require_post_deadline_band and np.isfinite(reach_deadline):
+        success = success and bool(post_deadline_violation_count == 0)
     if require_final_in_band:
-        success = success and bool(abs(final_error) <= comfort_band_c)
-    return {
+        success = success and bool(-lower_band <= final_error <= upper_band)
+    result = {
         "reach_time_s": reach_time,
         "sustained_reach_time_s": sustained_reach_time,
         "reach_slack_s": float(reach_deadline - reach_time) if np.isfinite(reach_time) else np.nan,
@@ -89,4 +98,38 @@ def summarize_closed_loop(
         "electric_kwh": electric_kwh,
         "thermal_kwh": thermal_kwh,
         "energy_efficiency": thermal_kwh / electric_kwh if electric_kwh > 0 else np.nan,
+        "comfort_lower_band_c": lower_band,
+        "comfort_upper_band_c": upper_band,
     }
+    if np.isfinite(reach_deadline):
+        after_deadline = elapsed >= reach_deadline
+        if after_deadline.any():
+            post_error = error[after_deadline]
+            result.update(
+                {
+                    "post_deadline_temp_error_mean_c": float(np.mean(post_error)),
+                    "post_deadline_temp_error_std_c": float(np.std(post_error)),
+                    "post_deadline_temp_error_min_c": float(np.min(post_error)),
+                    "post_deadline_temp_error_max_c": float(np.max(post_error)),
+                    "post_deadline_temp_range_c": float(np.ptp(post_error)),
+                }
+            )
+            for action_col in ("freq_target", "eev", "fan_out"):
+                if action_col not in frame:
+                    continue
+                values = frame.loc[after_deadline, action_col].to_numpy(dtype=float)
+                deltas = np.abs(np.diff(values))
+                result.update(
+                    {
+                        f"post_deadline_{action_col}_mean": float(np.mean(values)),
+                        f"post_deadline_{action_col}_std": float(np.std(values)),
+                        f"post_deadline_{action_col}_range": float(np.ptp(values)),
+                        f"post_deadline_{action_col}_mean_abs_step": (
+                            float(np.mean(deltas)) if len(deltas) else 0.0
+                        ),
+                        f"post_deadline_{action_col}_max_abs_step": (
+                            float(np.max(deltas)) if len(deltas) else 0.0
+                        ),
+                    }
+                )
+    return result

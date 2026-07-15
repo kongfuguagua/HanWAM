@@ -28,6 +28,14 @@ class HanWAMController(BaseController):
         step_seconds: int = 5,
     ):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        model_class = str((checkpoint.get("model_config") or {}).get("class_name", ""))
+        if model_class == "HanWAMBlockControllerModel":
+            architecture_version = str(checkpoint.get("architecture_version", ""))
+            if architecture_version != "hanwam_block_v1":
+                raise ValueError(
+                    "HanWAM block checkpoint must declare architecture_version="
+                    f"'hanwam_block_v1', got {architecture_version!r}"
+                )
         self.obs_cols = checkpoint["obs_cols"]
         self.target_action_cols = checkpoint["target_action_cols"]
         self.physical_cols = checkpoint["physical_cols"]

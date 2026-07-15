@@ -1,76 +1,85 @@
-# HanWAM 控制器
+# HanWAM
 
-HanWAM 是用于空调制冷控制的两阶段 latent world model + MPPI/MPC 控制器。当前干净提交保留 E065 代码、配置和服务集成，不提交真实 CSV、checkpoint 或评估输出。
+HanWAM is the current world-model MPC control line. It uses a block latent
+world model, a future-latent parameter prober, a single-lag thermal mechanism,
+and MPPI planning.
 
-## 数据接口
-
-标准 schema 定义在 `type.py`。
-
-观察量：
+## Active Files
 
 ```text
-freq, fan_out, fan_in, eev,
-T_out_coil, T_in_coil, T_out_discharge,
-T_in, T_out, energy_cum, T_set, mode
+config:          control/HanWAM/config/hanwam.yml
+checkpoint path: control/HanWAM/checkpoints/hanwam_mode1.pt
+tests:           tests/test_hanwam_block.py
 ```
 
-控制动作：
+Checkpoint architecture version is `hanwam_block_v1`. Trained `.pt` artifacts
+are intentionally excluded from this repository; place local weights under
+`control/HanWAM/checkpoints/` before running evaluation or the servicer.
+
+## Architecture
+
+One block contains 12 five-second frames, or 60 seconds. The current config uses
+4 history blocks and 8 future blocks.
 
 ```text
-freq_target, eev, fan_out
+history[48 x (obs, action)]
+        |
+        +-- encode once --> z0
+                              |
+candidate action paths --------+--> action-conditioned latent rollout
+                                      |
+                                future latents
+                                      |
+                        bounded parameter prober
+                                      |
+                    single-lag thermal mechanism
+                                      |
+                       future T_in and energy
+                                      |
+                 MPPI reach/clamp/energy/action cost
+                                      |
+                       first 5s command
 ```
 
-hard-mechanism prober 输出：
+Two implementation properties are intentional:
+
+- future latents drive the physical prober and cannot be bypassed;
+- each MPPI replan encodes history once, then reuses that prepared context for
+  all candidates and nominal evaluation.
+
+## Training And Evaluation
+
+```bash
+python -m control.HanWAM.train \
+  --config control/HanWAM/config/hanwam.yml \
+  --stage both --device cuda
+
+python -m control.MiniController.main \
+  --config control/HanWAM/config/hanwam.yml \
+  --stage eval
+```
+
+Stage I trains action-conditioned latent dynamics with Epps-Pulley SIGReg on
+predicted rollout latents. Stage II freezes the world model and trains the
+parameter prober against block-level `T_in_delta` and `electric_kwh_delta`
+targets.
+
+## Online Control Constraints
+
+- compressor candidate frequency: 10-80 Hz, no shutdown action;
+- EEV: 100-270;
+- outdoor fan: fixed at 750 rpm;
+- planner replans every 10 seconds and emits 5-second actions;
+- cost parts: reach, clamp, energy, and action.
+
+## Diagnostics
 
 ```text
-T_in_delta, electric_kwh_delta
+action_sensitivity.py     checks future-action influence on latent rollout
+action_response_sweep.py  checks checkpoint response across candidate actions
+action_analysis.py        summarizes closed-loop action behavior
+visualize_rollouts.py     plots retained rollout outputs when present locally
 ```
 
-planner 使用累计温度增量和非负电量增量评分候选动作序列。
-
-## 训练约定
-
-Stage 1 只训练 latent world model。Stage 2 载入 Stage 1 checkpoint，冻结 world model，只训练物理 prober 或 hard-mechanism prober。E065 的 Stage 2 仍复用 E062 h4/f8 Stage 1，实际 checkpoint 不在仓库内。
-
-主要外部 checkpoint 路径：
-
-```text
-control/HanWAM/checkpoints/hanwam_e062_h4_f8_lagged_energy_v1_mode1_stage1.pt
-control/HanWAM/checkpoints/hanwam_e065_positive_eev_energy_v1_mode1_stage2_epoch0040.pt
-control/HanWAM/checkpoints/hanwam_e065_lowfreq10_positive_eev_energy_v1_mode1.pt
-```
-
-## E065 配置
-
-E065 修正 E064 的 EEV 能耗项：在相同压缩机频率下，EEV 越大只增加非负附加功率，旧的 signed-linear 模式仍保留用于复现实验。
-
-```text
-config/hanwam_e065_positive_eev_energy_v1.yml
-config/hanwam_e065_lowfreq10_positive_eev_energy_v1.yml
-```
-
-`hanwam_e065_lowfreq10_positive_eev_energy_v1.yml` 是当前服务默认候选，允许 `10Hz` 连续低频运行，并将低频 anchors 显式绑定到低 EEV。
-
-## 规划约定
-
-MPPI 在未来动作块上采样，调用 HanWAM rollout，按 deadline 达温、舒适带约束、能耗和动作平滑评分，再下发第一个 receding-horizon 动作。
-
-当前生产风格配置：
-
-```text
-step_seconds = 5
-frames_per_block = 12
-history_blocks = 4
-future_blocks = 8
-horizon_steps = 96
-```
-
-## 代码入口
-
-```text
-model.py       world model 与 hard-mechanism controller model
-planner.py     MPPI planner 和 E060/E065 cost
-train.py       两阶段训练入口
-eval.py        标准场景评估入口
-utils.py       deadline 和共用工具
-```
+Tests use generated mock data and light models where possible, so the clean
+repository can be validated without committing real data or checkpoints.

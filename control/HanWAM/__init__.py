@@ -1,5 +1,5 @@
 """HanWAM learning controller package."""
 from .controller import HanWAMController
-from .model import HanWAM
+from .model import HanWAMBlockControllerModel, HanWAMWorldModel
 
-__all__ = ["HanWAM", "HanWAMController"]
+__all__ = ["HanWAMController", "HanWAMBlockControllerModel", "HanWAMWorldModel"]

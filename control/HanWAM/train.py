@@ -1,4 +1,4 @@
-"""Strict two-stage HanWAM E007 training.
+"""Strict two-stage HanWAM training.
 
 Stage 1 trains only the latent block world model with latent MSE + SIGReg.
 Stage 2 freezes that world model and trains only the physical prober.
@@ -110,35 +110,72 @@ def _planner_config(config: dict, mode: int) -> dict:
     frames_per_block, history_blocks, future_blocks = _block_params(config)
     planner = dict((config.get("method") or {}).get("planner") or {})
     planner.setdefault("algorithm", "mppi")
-    planner.setdefault("objective", "hanwam_e007")
-    planner.setdefault("horizon_steps", frames_per_block * future_blocks)
-    planner.setdefault("frames_per_block", frames_per_block)
-    planner.setdefault("future_blocks", future_blocks)
-    planner.setdefault("chunk_steps", frames_per_block)
-    planner.setdefault("control_interval_steps", 6)
-    planner.setdefault("num_samples", 512)
-    planner.setdefault("num_iterations", 3)
-    planner.setdefault("temperature", 1.0)
-    planner.setdefault("step_seconds", int(config["data"]["sampling"]["step_seconds"]))
-    planner.setdefault("reference_schedule", "deadline_linear")
-    planner.setdefault("comfort_band_reference", "schedule_then_target")
-    planner.setdefault("comfort_band_c", 0.5)
-    planner.setdefault("target_band_margin_seconds", 600.0)
-    planner.setdefault("deadline_comfort_band_c", 0.5)
-    planner.setdefault("target_margin_comfort_band_c", 0.5)
-    planner.setdefault("compressor_on_threshold_hz", 15.0)
-    planner.setdefault("snap_deadband_freq", True)
-    planner.setdefault(
-        "cost_weights",
+    planner.setdefault("objective", "phase_energy_clamp")
+    timing = dict(planner.get("timing") or {})
+    timing.setdefault("step_seconds", int(config["data"]["sampling"]["step_seconds"]))
+    timing.setdefault("frames_per_block", frames_per_block)
+    timing.setdefault("history_blocks", history_blocks)
+    timing.setdefault("future_blocks", future_blocks)
+    timing.setdefault("chunk_steps", frames_per_block)
+    timing.setdefault("control_interval_steps", 2)
+    timing.setdefault("horizon_steps", frames_per_block * future_blocks)
+    planner["timing"] = timing
+
+    sampling = dict(planner.get("sampling") or {})
+    sampling.setdefault("num_samples", 512)
+    sampling.setdefault("num_iterations", 3)
+    sampling.setdefault("temperature", 0.7)
+    sampling.setdefault("sample_std_fraction", 0.45)
+    sampling.setdefault("min_std_fraction", 0.02)
+    planner["sampling"] = sampling
+
+    actuator = dict(planner.get("actuator") or {})
+    actuator.setdefault("compressor_on_threshold_hz", 10.0)
+    actuator.setdefault("snap_deadband_freq", True)
+    planner["actuator"] = actuator
+
+    first_principles = dict(planner.get("first_principles") or {})
+    first_principles.setdefault("energy", {"reference_kwh_per_hour": 0.6})
+    first_principles.setdefault(
+        "phase",
         {
-            "comfort_band_violation": 4.0,
-            "target_margin_band_violation": 12.0,
-            "deadline_band_violation": 40.0,
-            "energy": 2.0,
-            "action_smooth": 0.20,
+            "reach_deadline_fraction": 0.65,
+            "reach_band_c": 0.45,
+            "hold_activation_c": 0.90,
+            "clamp_upper_c": 0.35,
+            "clamp_lower_c": 0.35,
+            "clamp_center_weight": 2.0,
+            "clamp_center_scale_c": 0.45,
         },
     )
-    planner.setdefault("history_blocks", history_blocks)
+    first_principles.setdefault(
+        "action",
+        {
+            "reference": "last_issued_command",
+            "loss": "huber",
+            "huber_delta": 0.20,
+            "pre_first_weight": 0.5,
+            "pre_sequence_weight": 0.8,
+            "hold_first_weight": 2.0,
+            "hold_sequence_weight": 1.5,
+            "post_first_weight": 2.5,
+            "post_sequence_weight": 2.0,
+        },
+    )
+    first_principles.setdefault(
+        "weights",
+        {
+            "reach": 80.0,
+            "clamp": 140.0,
+            "energy_pre": 0.9,
+            "energy_hold": 1.5,
+            "energy_post": 2.0,
+            "action_pre": 4.0,
+            "action_hold": 48.0,
+            "action_post": 64.0,
+        },
+    )
+    planner["first_principles"] = first_principles
     planner["mode"] = int(mode)
     return planner
 
@@ -163,6 +200,18 @@ def _prepare_data(config: dict, mode: int):
     val_limit = int(train_cfg.get("val_limit_transitions", min(limit, 8192) if limit > 0 else 0))
     train_arrays = block_sequence_arrays(runs, "train", config=config, limit=limit, seed=seed)
     val_arrays = block_sequence_arrays(runs, "val", config=config, limit=val_limit, seed=seed + 1)
+    def aggregate_physical(arrays):
+        obs, act_hist, future_act, target_obs, physical, keys = arrays
+        expected = future_blocks * frames_per_block
+        if physical.shape[1] != expected:
+            raise ValueError(f"expected {expected} physical steps, got {physical.shape[1]}")
+        physical = physical.reshape(
+            physical.shape[0], future_blocks, frames_per_block, physical.shape[-1]
+        ).sum(axis=2)
+        return obs, act_hist, future_act, target_obs, physical, keys
+
+    train_arrays = aggregate_physical(train_arrays)
+    val_arrays = aggregate_physical(val_arrays)
     train_obs_history, train_act_history, train_future_act, train_target_obs, train_physical, _ = train_arrays
     obs_norm = fit_normalizer(
         np.concatenate(
@@ -197,6 +246,8 @@ def _prepare_data(config: dict, mode: int):
         "future_blocks": future_blocks,
         "history_steps": frames_per_block * history_blocks,
         "horizon_steps": frames_per_block * future_blocks,
+        "physical_horizon_steps": future_blocks if block_physical else frames_per_block * future_blocks,
+        "physical_is_block": block_physical,
     }
 
 
@@ -220,6 +271,7 @@ def _loader(arrays, obs_norm, action_norm, physical_norm, batch_size: int) -> Da
 def _eval_stage1(model: HanWAMWorldModel, loader: DataLoader, device: torch.device, loss_cfg: dict) -> dict:
     model.eval()
     rows = []
+    action_rows = []
     for obs_b, act_hist_b, future_act_b, target_obs_b, _ in loader:
         obs_b = obs_b.to(device)
         act_hist_b = act_hist_b.to(device)
@@ -232,12 +284,46 @@ def _eval_stage1(model: HanWAMWorldModel, loader: DataLoader, device: torch.devi
             target_obs_b,
             **loss_cfg,
         )
-        rows.append([float(breakdown.total.cpu()), float(breakdown.latent.cpu()), float(breakdown.regularizer.cpu())])
-    return {
+        rows.append(
+            [
+                float(breakdown.total.cpu()),
+                float(breakdown.latent.cpu()),
+                float(breakdown.regularizer.cpu()),
+                float(breakdown.variance.cpu()),
+                float(breakdown.covariance.cpu()),
+            ]
+        )
+        if obs_b.shape[0] > 1:
+            z0 = model.encode_context(obs_b, act_hist_b)
+            pred = model.rollout_latents(z0, future_act_b)
+            shuffled_pred = model.rollout_latents(z0, future_act_b.roll(shifts=1, dims=0))
+            bsz, blocks, frames, obs_dim = target_obs_b.shape
+            target = model.encode_obs_block(target_obs_b.reshape(bsz * blocks, frames, obs_dim)).reshape(
+                bsz, blocks, model.latent_dim
+            )
+            true_mse = (pred - target).pow(2).mean()
+            shuffled_mse = (shuffled_pred - target).pow(2).mean()
+            sensitivity = (pred - shuffled_pred).pow(2).mean().sqrt()
+            action_rows.append([float(true_mse.cpu()), float(shuffled_mse.cpu()), float(sensitivity.cpu())])
+    result = {
         "val_stage1_loss": float(np.mean([r[0] for r in rows])),
         "val_latent_loss": float(np.mean([r[1] for r in rows])),
         "val_sigreg_loss": float(np.mean([r[2] for r in rows])),
+        "val_sigreg_scale_error": float(np.mean([r[3] for r in rows])),
+        "val_sigreg_mean_error": float(np.mean([r[4] for r in rows])),
     }
+    if action_rows:
+        true_mse = float(np.mean([r[0] for r in action_rows]))
+        shuffled_mse = float(np.mean([r[1] for r in action_rows]))
+        result.update(
+            {
+                "val_action_true_mse": true_mse,
+                "val_action_shuffled_mse": shuffled_mse,
+                "val_action_shuffle_error_ratio": shuffled_mse / max(true_mse, 1e-12),
+                "val_action_latent_sensitivity": float(np.mean([r[2] for r in action_rows])),
+            }
+        )
+    return result
 
 
 @torch.no_grad()
@@ -361,90 +447,54 @@ def _world_model_config(config: dict) -> dict:
 
 def _controller_model_config(config: dict, data: dict | None = None) -> dict:
     model_cfg = dict(((config.get("method") or {}).get("model") or {}))
-    class_name = str(model_cfg.get("class_name", "HanWAMControllerModel"))
+    class_name = str(model_cfg.get("class_name", "HanWAMBlockControllerModel"))
+    if class_name != "HanWAMBlockControllerModel":
+        raise ValueError(f"Unsupported HanWAM controller class: {class_name}")
     payload = {
         "class_name": class_name,
         "physical_dim": len(PHYSICAL_COLS),
         "prober_hidden_dim": int(model_cfg.get("prober_hidden_dim", model_cfg.get("hidden_dim", 128))),
-        "prober_action_scale": float(model_cfg.get("prober_action_scale", 1.0)),
+        "prober_action_scale": float(model_cfg.get("prober_action_scale", 0.0)),
         "world_model_config": _world_model_config(config),
     }
-    if class_name in {"HanWAMPhysicsGuidedControllerModel", "HanWAMHardMechanismControllerModel"}:
-        common_physics_keys = {
-            "freq_on_threshold_hz",
-            "freq_max_hz",
-            "fan_max",
-            "eev_min",
-            "eev_max",
-            "eev_width_min",
-            "eev_width_max",
-            "eev_effect_floor",
-            "compressor_energy_scale",
-            "fan_energy_scale",
-            "energy_model",
-            "energy_step_seconds",
-            "energy_power_intercept_w",
-            "energy_power_linear_w_per_hz",
-            "energy_power_quadratic_w_per_hz2",
-            "compressor_transition_hz",
-            "fan_effect_floor",
-            "freq_effect_floor",
-            "mechanism_context_blend",
-            "temperature_mechanism",
-            "baseline_drift_scale_c",
-            "cooling_history_seconds",
-            "cooling_freq_exponent",
-            "cooling_fan_exponent",
-            "cooling_fan_reference",
-            "cooling_eev_reference",
-            "cooling_eev_range",
-            "cooling_eev_gain_scale",
-            "cooling_eev_effect_min",
-            "cooling_eev_effect_max",
-            "cooling_lag_enabled",
-            "cooling_lag_alpha_min",
-            "cooling_lag_alpha_max",
-            "energy_eev_correction_mode",
-            "energy_eev_correction_scale_w",
-            "energy_eev_correction_min_w",
-            "energy_eev_correction_max_w",
-            "energy_eev_anchor",
-            "energy_eev_range",
-        }
-        soft_physics_keys = {
-            "passive_delta_scale",
-            "cooling_delta_scale",
-            "residual_delta_scale",
-            "residual_energy_scale",
-            "passive_nonnegative",
-        }
-        hard_physics_keys = {
-            "ua_delta_scale",
-            "internal_delta_scale",
-            "cooling_delta_scale",
-            "cop_min",
-            "cop_max",
-            "t_in_obs_index",
-            "t_out_obs_index",
-        }
-        physics_keys = set(common_physics_keys)
-        if class_name == "HanWAMPhysicsGuidedControllerModel":
-            physics_keys.update(soft_physics_keys)
-        if class_name == "HanWAMHardMechanismControllerModel":
-            physics_keys.update(hard_physics_keys)
-        for key in physics_keys:
-            if key in model_cfg:
-                payload[key] = model_cfg[key]
-        if data is not None:
-            payload["action_mean"] = data["action_norm"].mean.tolist()
-            payload["action_std"] = data["action_norm"].std.tolist()
-            payload["physical_mean"] = data["physical_norm"].mean.tolist()
-            payload["physical_std"] = data["physical_norm"].std.tolist()
-            payload["obs_mean"] = data["obs_norm"].mean.tolist()
-            payload["obs_std"] = data["obs_norm"].std.tolist()
-            columns = columns_from_config(config)["observation"]
-            payload["t_in_obs_index"] = int(columns.index("T_in"))
-            payload["t_out_obs_index"] = int(columns.index("T_out"))
+    model_keys = {
+        "step_seconds",
+        "freq_on_threshold_hz",
+        "freq_max_hz",
+        "compressor_transition_hz",
+        "cooling_freq_exponent",
+        "cooling_fan_exponent",
+        "cooling_fan_reference",
+        "cooling_eev_reference",
+        "cooling_eev_range",
+        "cooling_eev_gain_scale",
+        "cooling_eev_effect_min",
+        "cooling_eev_effect_max",
+        "ua_delta_max_c",
+        "internal_delta_max_c",
+        "cooling_delta_max_c",
+        "cooling_lag_alpha_min",
+        "cooling_lag_alpha_max",
+        "nominal_cooling_delta_c",
+        "nominal_cooling_lag_alpha",
+        "energy_power_intercept_w",
+        "energy_power_linear_w_per_hz",
+        "energy_power_quadratic_w_per_hz2",
+        "energy_eev_anchor",
+        "energy_eev_range",
+        "energy_eev_correction_max_w",
+    }
+    payload.update({key: model_cfg[key] for key in model_keys if key in model_cfg})
+    if data is not None:
+        payload["action_mean"] = data["action_norm"].mean.tolist()
+        payload["action_std"] = data["action_norm"].std.tolist()
+        payload["physical_mean"] = data["physical_norm"].mean.tolist()
+        payload["physical_std"] = data["physical_norm"].std.tolist()
+        payload["obs_mean"] = data["obs_norm"].mean.tolist()
+        payload["obs_std"] = data["obs_norm"].std.tolist()
+        columns = columns_from_config(config)["observation"]
+        payload["t_in_obs_index"] = int(columns.index("T_in"))
+        payload["t_out_obs_index"] = int(columns.index("T_out"))
     return payload
 
 
@@ -465,6 +515,9 @@ def _base_payload(config: dict, mode: int, data: dict, result_dir: Path) -> dict
         "future_blocks": int(data["future_blocks"]),
         "history_steps": int(data["history_steps"]),
         "horizon_steps": int(data["horizon_steps"]),
+        "physical_horizon_steps": int(data.get("physical_horizon_steps", data["horizon_steps"])),
+        "physical_is_block": True,
+        "architecture_version": "hanwam_block_v1",
         "resolved_config": config,
         "result_dir": str(result_dir),
     }
@@ -499,6 +552,10 @@ def train_stage1(
         "variance_target": float(loss_cfg.get("variance_target", 1.0)),
         "sigreg_num_projections": int(loss_cfg.get("sigreg_num_projections", 64)),
         "sigreg_mean_weight": float(loss_cfg.get("sigreg_mean_weight", 1.0)),
+        "sigreg_quadrature_points": int(loss_cfg.get("sigreg_quadrature_points", 17)),
+        "sigreg_integration_limit": float(loss_cfg.get("sigreg_integration_limit", 5.0)),
+        "sigreg_kernel_sigma": float(loss_cfg.get("sigreg_kernel_sigma", 1.0)),
+        "sigreg_projection_chunk_size": int(loss_cfg.get("sigreg_projection_chunk_size", 16)),
     }
     model = build_world_model(_world_model_config(config)).to(device)
     optimizer = torch.optim.AdamW(
@@ -531,13 +588,23 @@ def train_stage1(
             breakdown.total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
-            rows.append([float(breakdown.total.detach().cpu()), float(breakdown.latent.detach().cpu()), float(breakdown.regularizer.detach().cpu())])
+            rows.append(
+                [
+                    float(breakdown.total.detach().cpu()),
+                    float(breakdown.latent.detach().cpu()),
+                    float(breakdown.regularizer.detach().cpu()),
+                    float(breakdown.variance.detach().cpu()),
+                    float(breakdown.covariance.detach().cpu()),
+                ]
+            )
         row = {
             "stage": "stage1",
             "epoch": epoch,
             "loss": float(np.mean([r[0] for r in rows])),
             "latent_loss": float(np.mean([r[1] for r in rows])),
             "sigreg_loss": float(np.mean([r[2] for r in rows])),
+            "sigreg_scale_error": float(np.mean([r[3] for r in rows])),
+            "sigreg_mean_error": float(np.mean([r[4] for r in rows])),
         }
         if epoch == total_epochs or epoch % max(1, total_epochs // 5) == 0:
             row.update(_eval_stage1(model, val_loader, device, loss_cfg))

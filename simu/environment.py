@@ -18,6 +18,11 @@ try:
 except Exception:  # pragma: no cover - hybrid artifacts may be absent in minimal installs.
     HybridRoomEnv = None
 
+try:
+    from simu.roomv4 import HybridRoomV4Env
+except Exception:  # pragma: no cover - V4 artifact may be absent in minimal installs.
+    HybridRoomV4Env = None
+
 
 ENV_OBS_COLS = ["T_out", "T_out_coil", "T_out_discharge", "T_in", "T_in_coil", "RH_in", "fan_in"]
 
@@ -92,6 +97,7 @@ class EnvironmentSimulator:
         passive_heat_tau_seconds: float = 14_400.0,
         temperature_model: str | None = None,
         room_hybrid_kwargs: dict | None = None,
+        roomv4_kwargs: dict | None = None,
         temperature_env: object | None = None,
     ):
         self.mode = mode
@@ -110,6 +116,11 @@ class EnvironmentSimulator:
                 raise RuntimeError("simulator.environment.temperature_model=room_hybrid requires simu.room_hybrid artifacts")
             self.temperature_env = HybridRoomEnv(**(room_hybrid_kwargs or {}))
             self.temperature_model = "room_hybrid"
+        elif requested_temperature_model in {"roomv4", "room_v4"}:
+            if HybridRoomV4Env is None:
+                raise RuntimeError("simulator.environment.temperature_model=roomv4 requires simu.roomv4 artifacts")
+            self.temperature_env = HybridRoomV4Env(**(roomv4_kwargs or {}))
+            self.temperature_model = "roomv4"
         elif str(mode) in {"1", "1.0"} and ContinuousEnthalpyRoomEnv is not None:
             self.temperature_env = ContinuousEnthalpyRoomEnv(
                 passive_heat_tau_seconds=self.passive_heat_tau_seconds
@@ -142,7 +153,7 @@ class EnvironmentSimulator:
             self.fan_in = self.rated_fan_rpm
 
         self.elapsed_seconds = 0.0
-        if self.temperature_model == "room_hybrid":
+        if self.temperature_model in {"room_hybrid", "roomv4"}:
             if isinstance(initial_state, dict):
                 temp = self.temperature_env.reset(initial_observation=initial_state)
             else:

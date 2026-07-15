@@ -190,6 +190,7 @@ def run_closed_loop(
         mode=mode,
         step_seconds=step_seconds,
         freq_cap=freq_cap,
+        energy_model=ac_cfg.get("energy_model"),
         freq_params=ac_cfg.get("freq_params") or {},
     )
     env = EnvironmentSimulator(
@@ -202,6 +203,8 @@ def run_closed_loop(
         passive_heat_tau_seconds=float(env_cfg.get("passive_heat_tau_seconds", 14_400.0)),
         temperature_model=env_cfg.get("temperature_model"),
         room_hybrid_kwargs=env_cfg.get("room_hybrid") or {},
+        roomv4_kwargs=env_cfg.get("roomv4") or env_cfg.get("room_v4") or {},
+        temperature_env=env_cfg.get("temperature_env"),
     )
     ac_state = ac.reset(freq0=float(frame["freq"].iloc[0]), target0=float(frame["freq_target"].iloc[0]))
     env_state = env.reset(initial_environment_state(frame))
@@ -438,6 +441,18 @@ def run_eval_from_config(config: dict) -> dict:
                         trajectory,
                         target,
                         comfort_band_c=float(eval_cfg["comfort_band_c"]),
+                        comfort_lower_band_c=float(
+                            scenario.get(
+                                "comfort_lower_band_c",
+                                eval_cfg.get("comfort_lower_band_c", eval_cfg["comfort_band_c"]),
+                            )
+                        ),
+                        comfort_upper_band_c=float(
+                            scenario.get(
+                                "comfort_upper_band_c",
+                                eval_cfg.get("comfort_upper_band_c", eval_cfg["comfort_band_c"]),
+                            )
+                        ),
                         ddl_seconds=ddl_seconds,
                         require_final_in_band=bool(
                             scenario.get(
@@ -453,6 +468,12 @@ def run_eval_from_config(config: dict) -> dict:
                             scenario.get(
                                 "success_requires_post_reach_band",
                                 eval_cfg.get("success_requires_post_reach_band", False),
+                            )
+                        ),
+                        require_post_deadline_band=bool(
+                            scenario.get(
+                                "success_requires_post_deadline_band",
+                                eval_cfg.get("success_requires_post_deadline_band", False),
                             )
                         ),
                     )

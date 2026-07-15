@@ -13,7 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze controller actions, compressor cycles, and off-state cooling")
     parser.add_argument("--rollout-dir", type=Path, required=True, help="Directory containing controller_log.csv")
     parser.add_argument("--output-dir", type=Path, default=None, help="Defaults to --rollout-dir")
-    parser.add_argument("--on-threshold-hz", type=float, default=15.0)
+    parser.add_argument("--on-threshold-hz", type=float, default=10.0)
     parser.add_argument("--actual-on-threshold-hz", type=float, default=1.0)
     parser.add_argument("--short-cycle-seconds", type=float, default=180.0)
     parser.add_argument("--high-fan-threshold", type=float, default=500.0)

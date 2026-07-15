@@ -151,14 +151,43 @@ def load_run(path: Path, step_seconds: int = 5, mode: int | None = 1, config: di
     frame = frame.sort_values("ts").drop_duplicates("ts", keep="last")
 
     numeric = [col for col in needed if col != "ts"]
-    frame = (
-        frame.set_index("ts")[numeric]
-        .resample(f"{step_seconds}s")
-        .mean()
-        .interpolate(method="time", limit=interpolation_limit, limit_direction="both")
-        .dropna()
-        .reset_index()
-    )
+    indexed = frame.set_index("ts")[numeric]
+    # Commands/setpoints/enums are held signals.  Averaging or linearly
+    # interpolating them creates actions that were never issued and corrupts
+    # action-conditioned world-model targets.
+    hold_columns = [
+        col
+        for col in ("freq_in_tgt", "eev", "fan_out", "mode", "T_set")
+        if col in indexed.columns
+    ]
+    cumulative_columns = [col for col in ("energy_cum",) if col in indexed.columns]
+    sensor_columns = [
+        col for col in indexed.columns if col not in set(hold_columns + cumulative_columns)
+    ]
+    pieces = []
+    if sensor_columns:
+        sensors = (
+            indexed[sensor_columns]
+            .resample(f"{step_seconds}s")
+            .mean()
+            .interpolate(method="time", limit=interpolation_limit, limit_direction="both")
+        )
+        pieces.append(sensors)
+    if hold_columns:
+        held = indexed[hold_columns].resample(f"{step_seconds}s").last()
+        held = held.ffill(limit=interpolation_limit).bfill(limit=interpolation_limit)
+        pieces.append(held)
+    if cumulative_columns:
+        cumulative = indexed[cumulative_columns].resample(f"{step_seconds}s").last()
+        cumulative = cumulative.interpolate(
+            method="time",
+            limit=interpolation_limit,
+            limit_direction="both",
+        )
+        for col in cumulative_columns:
+            cumulative[col] = cumulative[col].cummax()
+        pieces.append(cumulative)
+    frame = pd.concat(pieces, axis=1)[numeric].dropna().reset_index()
     if len(frame):
         frame["elapsed_seconds"] = (frame["ts"] - frame["ts"].iloc[0]).dt.total_seconds().astype(np.float32)
     if mode is not None:

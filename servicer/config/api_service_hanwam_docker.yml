@@ -8,7 +8,7 @@ logging:
   level: info
   mode: both
   path: /app/outputs/servicer/hanwam_service.log
-  payloads: true
+  payloads: false
   max_bytes: 52428800
   backup_count: 5
 
@@ -16,6 +16,6 @@ controller:
   type: hanwam_wm_mpc
   mode: 1
   step_seconds: 5
-  algorithm_config: /app/control/HanWAM/config/hanwam_e065_lowfreq10_positive_eev_energy_v1.yml
-  checkpoint: /app/control/HanWAM/checkpoints/hanwam_e065_lowfreq10_positive_eev_energy_v1_mode1.pt
+  algorithm_config: /app/control/HanWAM/config/hanwam.yml
+  checkpoint: /app/control/HanWAM/checkpoints/hanwam_mode1.pt
   planner_overrides: {}

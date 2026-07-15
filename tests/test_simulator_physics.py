@@ -1,56 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
-from tempfile import TemporaryDirectory
+import tempfile
 import unittest
 
 import joblib
 import numpy as np
+import pandas as pd
 
 from simu.environment import EnvironmentSimulator
 from simu.air_conditioner import AirConditionerSimulator
 from simu.frequency.freq_response_model import simulate_freq
-from simu.room.continuous_model import PLANT_STATE_COLUMNS
+from simu.room.continuous_model import STATE_COLUMNS
 from simu.room.simulator import ContinuousEnthalpyRoomEnv
-
-
-class _ConstantRoomModel:
-    def predict(self, features):
-        return np.full(len(features), 30.0, dtype=np.float32)
-
-
-def _mock_room_payload() -> dict:
-    medians = {
-        "T_out": 35.0,
-        "T_out_coil": 35.0,
-        "T_out_discharge": 36.0,
-        "T_in": 30.0,
-        "T_in_coil": 30.0,
-        "RH_in": 0.6,
-        "mode": 1.0,
-        "energy_cum": 0.0,
-        "fault": 0.0,
-        "swing": 0.0,
-        "inference_freq": 0.0,
-        "inference_eev": 165.0,
-        "inference_fan_out": 850.0,
-        "inference_fan_in": 900.0,
-    }
-    return {
-        "supported_mode": 1,
-        "model": _ConstantRoomModel(),
-        "feature_variant": "autoregressive_mock",
-        "state_columns": list(PLANT_STATE_COLUMNS),
-        "state_medians": np.asarray([medians[col] for col in PLANT_STATE_COLUMNS], dtype=np.float32),
-        "dt_seconds": 5.0,
-        "continuity": {"tau_seconds": 90.0, "max_rate_c_per_min": 0.5},
-        "feature_config": {
-            "batch1_control_memory": True,
-            "batch2_approach_temps": True,
-            "batch3_interactions": True,
-        },
-        "heat_load_config": {},
-    }
 
 
 class _ZeroEnergyModel:
@@ -74,27 +36,44 @@ class _CoolingFakeEnv:
         }
 
 
+class _FlatRoomModel:
+    def predict(self, values):
+        return np.zeros(len(values), dtype=np.float32)
+
+
+def _write_mock_room_model(path: Path) -> None:
+    medians = pd.Series(0.0, index=STATE_COLUMNS, dtype=float)
+    medians["mode"] = 1.0
+    medians["T_set"] = 27.0
+    payload = {
+        "supported_mode": 1,
+        "model": _FlatRoomModel(),
+        "feature_variant": "thermal_inertia",
+        "state_columns": list(STATE_COLUMNS),
+        "state_medians": medians.to_numpy(np.float32),
+        "dt_seconds": 5.0,
+        "continuity": {"tau_seconds": 90.0, "max_rate_c_per_min": 0.5},
+        "use_physics_offcycle": True,
+    }
+    joblib.dump(payload, path)
+
+
 class SimulatorPhysicsTest(unittest.TestCase):
     def test_v3_fan_only_warms_with_outdoor_heat_load(self):
-        with TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
             model_path = Path(tmpdir) / "continuous_cooling_model.joblib"
-            joblib.dump(_mock_room_payload(), model_path)
+            _write_mock_room_model(model_path)
             env = ContinuousEnthalpyRoomEnv(model_path)
             obs = {
                 "T_out": 35.0,
                 "T_out_coil": 35.0,
-                "T_out_discharge": 36.0,
                 "T_in": 30.0,
                 "T_in_coil": 30.0,
                 "RH_in": 0.6,
+                "fan_in": 900.0,
+                "T_set": 26.0,
                 "mode": 1,
                 "energy_cum": 0.0,
-                "fault": 0.0,
-                "swing": 0.0,
-                "inference_freq": 0.0,
-                "inference_eev": 165.0,
-                "inference_fan_out": 850.0,
-                "inference_fan_in": 900.0,
             }
             start = env.reset(initial_observation=obs)["T_in"]
             for _ in range(120):
